@@ -79,7 +79,18 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
-        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
+        if "cuda" in str(cur_token.device):
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
+                next_token, next_prob = decode_one_token(
+                    model, cur_token, input_pos, **sampling_kwargs
+                )
+                input_pos += 1
+                new_tokens.append(next_token.clone())
+                callback(new_tokens[-1])
+                new_probs.append(next_prob.clone())
+                cur_token = next_token.view(1, -1)
+        else:
+            # [By] For CPU
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
@@ -286,14 +297,14 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
             elif proj in ['down']:
                 sparses[proj] = distrs["mlp_h2"].icdf(val).item()
 
-        is_sparse = True
+        is_sparse = False
 
         layer.feed_forward.gemv1_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
         layer.feed_forward.gemv1 = layer.feed_forward.gemv1_kernel.operator(True)
         layer.feed_forward.thresh_up = sparses["up"]
         layer.feed_forward.thresh_gate = sparses["gate"]
         layer.feed_forward.sparsity_bin = 0
-        layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.data.T.contiguous().T # column major
+        layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.da  ta.T.contiguous().T # column major
         layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous().T # column major
 
         layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
@@ -320,7 +331,11 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.feed_forward.apply_monkeypatch()
         layer.attention.apply_monkeypatch()
 
-        torch.cuda.empty_cache()
+        if "cuda" in str(device):
+            torch.cuda.empty_cache()
+        else:
+            import gc
+            gc.collect() # Force garbage collection to free up CPU memory
 
     print("Monkeypatching with activation sparsity...")
     print(model.layers[0].feed_forward.w1.weight.data.shape)
@@ -503,7 +518,10 @@ def main(
         print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
 
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
-    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+    if "cuda" in str(device):
+        print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+    else:
+        print(f"Memory used: CPU memory monitoring have not implemented")
 
     # debug writeout
     # Prepare debug writeout data
@@ -552,7 +570,6 @@ if __name__ == '__main__':
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
         args.speculate_k, args.device, 
-        
         # monkeypatch
         args.hist_path, args.sparsity,
     )
