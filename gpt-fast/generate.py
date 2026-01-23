@@ -16,7 +16,7 @@ import torch
 
 import torch._dynamo
 torch._dynamo.reset()
-
+torch._dynamo.config.suppress_errors = True
 # disable for now, incompatible with our kernel (for accurate baseline)
 # torch._inductor.config.epilogue_fusion = False
 
@@ -255,6 +255,9 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     if "model" in checkpoint and "stories" in str(checkpoint_path):
         checkpoint = checkpoint["model"]
+    # Some checkpoints (e.g., Meta LLaMA) store a precomputed rope.freqs buffer
+    # that is not part of this implementation. Drop it to avoid unexpected key errors.
+    checkpoint.pop("rope.freqs", None)
     model.load_state_dict(checkpoint, assign=True)
 
     if use_tp:
@@ -304,7 +307,7 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.feed_forward.thresh_up = sparses["up"]
         layer.feed_forward.thresh_gate = sparses["gate"]
         layer.feed_forward.sparsity_bin = 0
-        layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.da  ta.T.contiguous().T # column major
+        layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.data.T.contiguous().T # column major
         layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous().T # column major
 
         layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
@@ -398,7 +401,7 @@ def main(
             print = lambda *args, **kwargs: None
 
     print(f"Using device={device}")
-    precision = torch.float16
+    precision = torch.float32
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
 
