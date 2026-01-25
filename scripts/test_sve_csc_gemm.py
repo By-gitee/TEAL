@@ -1,8 +1,8 @@
 """
-ARM SVE 稀疏 GEMM 算子的正确性与性能测试。
+ARM SVE CSC 稀疏 GEMM 算子的正确性与性能测试。
 
 运行方式:
-    python -m scripts.test_sve_sparse_gemm
+    python -m scripts.test_sve_csc_gemm
 """
 
 from __future__ import annotations
@@ -10,10 +10,11 @@ from __future__ import annotations
 import argparse
 import torch
 
-from kernels.sve_sparse_gemm import (
-    SVESparseGEMMKernel,
-    load_sve_sparse_gemm_extension,
+from kernels.sve_csc_gemm import (
+    SVECSCGEMMKernel,
+    load_sve_csc_gemm_extension,
     measure_latency,
+    sve_csc_gemm,
 )
 
 
@@ -42,30 +43,6 @@ def _make_random_sparse_activation(
     return x * keep
 
 
-def _get_sparse_indices(activation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    从稀疏 activation 中提取非零元素的索引信息。
-    
-    Returns:
-        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
-        nz_col_indices: 扁平化的列索引向量
-    """
-    M, K = activation.shape
-    nz_pairs = []
-    nz_col_indices = []
-    
-    for m in range(M):
-        row = activation[m]
-        nz_idx = torch.nonzero(row != 0, as_tuple=False).flatten()
-        if len(nz_idx) > 0:
-            nz_pairs.extend([m, len(nz_idx)])
-            nz_col_indices.append(nz_idx)
-    
-    nz_counts = torch.tensor(nz_pairs, dtype=torch.int64)
-    nz_col_indices = torch.cat(nz_col_indices, dim=0).to(dtype=torch.int64) if len(nz_col_indices) > 0 else torch.tensor([], dtype=torch.int64)
-    
-    return nz_counts, nz_col_indices
-
 def _get_sparse_indices_uint32(activation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     从稀疏 activation 中提取非零元素的索引信息。
@@ -90,14 +67,15 @@ def _get_sparse_indices_uint32(activation: torch.Tensor) -> tuple[torch.Tensor, 
     
     return nz_counts, nz_col_indices
 
+
 def check_correctness(sparsity: float, seed: int) -> None:
     """测试算子的正确性"""
     print("=" * 60)
     print("测试1: 正确性验证")
     print("=" * 60)
 
-    load_sve_sparse_gemm_extension(verbose=False)
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    load_sve_csc_gemm_extension(verbose=False)
+    kernel = SVECSCGEMMKernel.initialize(name="sve_csc_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 创建测试数据
@@ -109,7 +87,7 @@ def check_correctness(sparsity: float, seed: int) -> None:
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
     
     # 调用算子
-    result_sve = op(activation, weight, nz_counts, nz_col_indices)
+    result_sve = op(activation, weight, nz_counts, nz_col_indices, 0)
 
     # 参考计算：直接使用 PyTorch 的 matmul
     result_ref = torch.matmul(activation, weight)
@@ -126,7 +104,7 @@ def check_correctness(sparsity: float, seed: int) -> None:
         print("✅ 正确性测试通过")
     else:
         print("❌ 正确性测试失败")
-        print(f"SVE结果:\n{result_sve}")
+        print(f"CSC结果:\n{result_sve}")
         print(f"参考结果:\n{result_ref}")
         print(f"差异:\n{result_sve - result_ref}")
 
@@ -137,7 +115,7 @@ def test_sparse_pattern() -> None:
     print("测试2: 稀疏模式验证")
     print("=" * 60)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVECSCGEMMKernel.initialize(name="sve_csc_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     M, K, N = 5, 10, 4
@@ -152,7 +130,7 @@ def test_sparse_pattern() -> None:
     activation[4, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]] = torch.randn(10)  # 全非零
 
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result_sve = op(activation, weight, nz_counts, nz_col_indices)
+    result_sve = op(activation, weight, nz_counts, nz_col_indices, 0)
 
     # 参考计算
     result_ref = torch.matmul(activation, weight)
@@ -170,7 +148,7 @@ def test_edge_cases() -> None:
     print("测试3: 边界情况")
     print("=" * 60)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVECSCGEMMKernel.initialize(name="sve_csc_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 测试1: 单行单元素
@@ -179,7 +157,7 @@ def test_edge_cases() -> None:
     weight = torch.randn(5, 4, dtype=torch.float32)
     activation[0, 2] = 1.5
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
+    result = op(activation, weight, nz_counts, nz_col_indices, 0)
     expected = torch.matmul(activation, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "单行单元素测试失败"
     print("  ✅ 通过")
@@ -189,7 +167,7 @@ def test_edge_cases() -> None:
     activation = torch.zeros(3, 4, dtype=torch.float32)
     weight = torch.randn(4, 5, dtype=torch.float32)
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
+    result = op(activation, weight, nz_counts, nz_col_indices, 0)
     expected = torch.zeros(3, 5, dtype=torch.float32)
     assert torch.allclose(result, expected), "全零矩阵测试失败"
     print("  ✅ 通过")
@@ -199,7 +177,7 @@ def test_edge_cases() -> None:
     activation = torch.randn(4, 6, dtype=torch.float32)
     weight = torch.randn(6, 8, dtype=torch.float32)
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
+    result = op(activation, weight, nz_counts, nz_col_indices, 0)
     expected = torch.matmul(activation, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "全非零矩阵测试失败"
     print("  ✅ 通过")
@@ -214,7 +192,7 @@ def test_edge_cases() -> None:
     activation[3, :0] = torch.randn(0)  # 0 个非零
     activation[4, :5] = torch.randn(5)  # 5 个非零
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
+    result = op(activation, weight, nz_counts, nz_col_indices, 0)
     expected = torch.matmul(activation, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "不同非零数测试失败"
     print("  ✅ 通过")
@@ -227,7 +205,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     print("=" * 60)
     # torch.set_num_threads(1)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVECSCGEMMKernel.initialize(name="sve_csc_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 创建较大的测试数据（模拟实际场景）
@@ -237,29 +215,25 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
 
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
 
-    # 测试SVE算子性能
-    def sve_fn():
-        # nz_counts, nz_col_indices = _get_sparse_indices(activation)
-        return op(activation, weight, nz_counts, nz_col_indices)
+    # 测试CSC算子性能
+    def csc_fn():
+        return op(activation, weight, nz_counts, nz_col_indices, 0)
 
-    lat_sve = measure_latency(sve_fn, warmup=10, iters=10000)
-    print(f"⏱️  SVE GEMM 算子平均延迟: {lat_sve:.4f} ms")
+    lat_csc = measure_latency(csc_fn, warmup=10, iters=10000)
+    print(f"⏱️  CSC GEMM 算子平均延迟: {lat_csc:.4f} ms")
     print(f"   输入形状: activation={activation.shape}, weight={weight.shape}")
     print(f"   稀疏度(sparsity): {sparsity:.3f}")
-    # print(f"   非零元素数: {nnz}/{M*K} ({100*nnz/(M*K):.1f}%)")
 
     # 对比PyTorch标准实现：直接 matmul
-    # weight = torch.randn(N, K, dtype=torch.float32)
     torch.backends.mkldnn.enabled = True 
 
     def pytorch_dense_fn():
         return torch.matmul(activation, weight)
 
-
     lat_pytorch_dense = measure_latency(pytorch_dense_fn, warmup=10, iters=10000)
     print(f"⏱️  PyTorch 稠密 matmul 平均延迟: {lat_pytorch_dense:.4f} ms")
-    if lat_sve > 0:
-        print(f"   加速比: {lat_pytorch_dense/lat_sve:.2f}x")
+    if lat_csc > 0:
+        print(f"   加速比: {lat_pytorch_dense/lat_csc:.2f}x")
 
     # 对比PyTorch稀疏实现：to_sparse_csr + sparse.mm
     def pytorch_sparse_fn():
@@ -268,8 +242,8 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
 
     lat_pytorch_sparse = measure_latency(pytorch_sparse_fn, warmup=10, iters=10000)
     print(f"⏱️  PyTorch 稀疏 CSR + sparse.mm 平均延迟: {lat_pytorch_sparse:.4f} ms")
-    if lat_sve > 0:
-        print(f"   加速比: {lat_pytorch_sparse/lat_sve:.2f}x")
+    if lat_csc > 0:
+        print(f"   加速比: {lat_pytorch_sparse/lat_csc:.2f}x")
 
 
 def test_direct_torch_ops() -> None:
@@ -278,7 +252,7 @@ def test_direct_torch_ops() -> None:
     print("测试5: 直接使用 torch.ops 调用")
     print("=" * 60)
 
-    load_sve_sparse_gemm_extension(verbose=False)
+    load_sve_csc_gemm_extension(verbose=False)
 
     # 直接使用 torch.ops 调用
     M, K, N = 5, 8, 4
@@ -287,8 +261,8 @@ def test_direct_torch_ops() -> None:
 
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
     
-    result_direct = torch.ops.teal.sve_sparse_gemm(
-        activation, weight, nz_counts, nz_col_indices
+    result_direct = torch.ops.teal_csc.sve_csc_gemm(
+        activation, weight, nz_counts, nz_col_indices, 0
     )
 
     # 参考计算

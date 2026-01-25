@@ -187,14 +187,13 @@ void check_gemm_inputs(
   TORCH_CHECK(nz_counts.is_contiguous(), "nz_counts must be contiguous");
   TORCH_CHECK(nz_col_indices.is_contiguous(), "nz_col_indices must be contiguous");
 
-  const auto M = activation.size(0);
   const auto K = activation.size(1);
   TORCH_CHECK(weight.size(0) == K, "weight K dimension must match activation K");
-  TORCH_CHECK(nz_counts.size(0) == M, "nz_counts length must match activation M");
+  TORCH_CHECK(nz_counts.size(0) % 2 == 0, "nz_counts length must be even (pairs of row_idx, count)");
 }
 
 // Sparse GEMM: (M, K) sparse × (K, N) dense → (M, N)
-// nz_counts: (M,) number of non-zero elements per row
+// nz_counts: pairs of (row_idx, count) for rows with non-zero elements
 // nz_col_indices: flattened column indices for all non-zero elements
 torch::Tensor sve_sparse_gemm(
     torch::Tensor activation,
@@ -219,17 +218,30 @@ torch::Tensor sve_sparse_gemm(
   const uint32_t* indices_ptr = nz_col_indices.data_ptr<uint32_t>();
   float* out_ptr = output.data_ptr<float>();
 
-  // Compute cumulative offset for each row's indices
-  std::vector<int64_t> row_offsets(M + 1, 0);
-  for (int64_t i = 0; i < M; ++i) {
-    row_offsets[i + 1] = row_offsets[i] + counts_ptr[i];
+  // Parse nz_counts: pairs of (row_idx, count)
+  const int64_t num_nz_rows = nz_counts.size(0) / 2;
+  
+  // Build mapping from row index to offset in nz_col_indices
+  std::vector<int64_t> row_indices;
+  std::vector<int64_t> row_offsets;
+  int64_t cumulative_offset = 0;
+  
+  for (int64_t i = 0; i < num_nz_rows; ++i) {
+    const int64_t row_idx = counts_ptr[2 * i];
+    const int64_t count = counts_ptr[2 * i + 1];
+    
+    TORCH_CHECK(row_idx >= 0 && row_idx < M, "row_idx out of range");
+    TORCH_CHECK(count >= 0, "count must be non-negative");
+    
+    row_indices.push_back(row_idx);
+    row_offsets.push_back(cumulative_offset);
+    cumulative_offset += count;
   }
 
   // Verify total non-zero count matches
-  const int64_t total_nnz = row_offsets[M];
   TORCH_CHECK(
-      nz_col_indices.numel() == total_nnz,
-      "nz_col_indices size must equal sum of nz_counts");
+      nz_col_indices.numel() == cumulative_offset,
+      "nz_col_indices size must equal sum of counts in nz_counts");
 #if defined(__ARM_FEATURE_SVE)
   const int64_t vl = svcntw();
   const uint32_t N_u32 = (uint32_t)N;
@@ -243,16 +255,17 @@ torch::Tensor sve_sparse_gemm(
     // 一个 parallel 区：避免嵌套
     #pragma omp parallel
     {
-      // collapse(2) 同时切 (m, n_block)
+      // collapse(2) 同时切 (row_idx, n_block)
       #pragma omp for collapse(2) schedule(static)
-      for (int64_t m = 0; m < M; ++m) {
+      for (int64_t row_idx = 0; row_idx < num_nz_rows; ++row_idx) {
         for (int64_t n = 0; n < n_full; n += n_block_sz) {
 
-          const int64_t nnz = counts_ptr[m];
+          const int64_t m = row_indices[row_idx];
+          const int64_t nnz = counts_ptr[2 * row_idx + 1];
           if (nnz == 0) continue;
 
           const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + row_offsets[m];
+          const uint32_t* idx_ptr = indices_ptr + row_offsets[row_idx];
 
           // 每个线程只写自己负责的 4 个输出
           float* out_row_ptr = out_ptr + m * N;
@@ -294,15 +307,16 @@ torch::Tensor sve_sparse_gemm(
         } // n_full blocks
       } // m
 
-      // tail：同样可以并行按 (m) 或 (m, tail) 处理；这里给一个简单按 m 的并行写法
+      // tail：同样可以并行按 (row_idx) 或 (row_idx, tail) 处理；这里给一个简单按 row_idx 的并行写法
       if (rem > 0) {
         #pragma omp for schedule(static)
-        for (int64_t m = 0; m < M; ++m) {
-          const int64_t nnz = counts_ptr[m];
+        for (int64_t row_idx = 0; row_idx < num_nz_rows; ++row_idx) {
+          const int64_t m = row_indices[row_idx];
+          const int64_t nnz = counts_ptr[2 * row_idx + 1];
           if (nnz == 0) continue;
 
           const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + row_offsets[m];
+          const uint32_t* idx_ptr = indices_ptr + row_offsets[row_idx];
           float* out_row_ptr = out_ptr + m * N;
 
           const int64_t n_start = n_full;
