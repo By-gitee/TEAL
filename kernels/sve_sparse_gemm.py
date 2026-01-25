@@ -1,5 +1,5 @@
 """
-ARM SVE 稀疏 GEMV 自定义算子封装。
+ARM SVE 稀疏 GEMV/GEMM 自定义算子封装。
 
 提供：
 1. C++ 扩展加载与注册。
@@ -22,9 +22,9 @@ from kernels.compile_wrapper import BaseKernel
 
 
 ROOT = Path(__file__).resolve().parent
-CPP_ROOT = ROOT / "cpp_sve_sparse_gemv"
+CPP_ROOT = ROOT / "cpp_sve_sparse_gemm"
 BUILD_DIR = CPP_ROOT / "_build"
-EXT_NAME = "teal_sve_sparse_gemv_ext"
+EXT_NAME = "teal_sve_sparse_gemm_ext"
 
 
 def _extra_cflags() -> list[str]:
@@ -46,24 +46,25 @@ def _extra_ldflags() -> list[str]:
     return ["-fopenmp"]
 
 
-def load_sve_sparse_gemv_extension(
+def load_sve_sparse_gemm_extension(
     rebuild: bool = False,
     verbose: bool = False,
 ) -> Optional[torch.types.ModuleType]:
     """
     编译并加载 C++ 扩展。若算子已注册则跳过重复构建。
     """
-    # if (
-    #     not rebuild
-    #     and hasattr(torch.ops, "teal")
-    #     and hasattr(torch.ops.teal, "sve_sparse_gemv")
-    # ):
-    #     return None
+    if (
+        not rebuild
+        and hasattr(torch.ops, "teal")
+        and hasattr(torch.ops.teal, "sve_sparse_gemv")
+        and hasattr(torch.ops.teal, "sve_sparse_gemm")
+    ):
+        return None
 
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     return load(
         name=EXT_NAME,
-        sources=[str(CPP_ROOT / "sve_sparse_gemv_op.cpp")],
+        sources=[str(CPP_ROOT / "sve_sparse_gemm_op.cpp")],
         build_directory=str(BUILD_DIR),
         extra_cflags=_extra_cflags(),
         extra_ldflags=_extra_ldflags(),
@@ -73,7 +74,7 @@ def load_sve_sparse_gemv_extension(
 
 class SVESparseGEMVKernel(BaseKernel):
     """
-    torch.compile 兼容的 wrapper。
+    torch.compile 兼容的 GEMV wrapper。
     """
 
     def meta(
@@ -92,8 +93,35 @@ class SVESparseGEMVKernel(BaseKernel):
         nz_row: int,
         nz_col_index: torch.Tensor,
     ) -> torch.Tensor:
-        load_sve_sparse_gemv_extension()
+        load_sve_sparse_gemm_extension()
         return torch.ops.teal.sve_sparse_gemv(activation, weight, nz_row, nz_col_index)
+
+
+class SVESparseGEMMKernel(BaseKernel):
+    """
+    torch.compile 兼容的 GEMM wrapper。
+    """
+
+    def meta(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        M = activation.size(0)
+        N = weight.size(1)
+        return activation.new_empty((M, N), device="meta")
+
+    def forward(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        load_sve_sparse_gemm_extension()
+        return torch.ops.teal.sve_sparse_gemm(activation, weight, nz_counts, nz_col_indices)
 
 
 def measure_latency(

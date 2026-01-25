@@ -10,9 +10,9 @@ from __future__ import annotations
 import argparse
 import torch
 
-from kernels.sve_sparse_gemv import (
+from kernels.sve_sparse_gemm import (
     SVESparseGEMVKernel,
-    load_sve_sparse_gemv_extension,
+    load_sve_sparse_gemm_extension,
     measure_latency,
 )
 
@@ -42,10 +42,13 @@ def _make_random_sparse_activation(
     return x * keep
 
 
-def _get_nz_col_index_from_row(activation: torch.Tensor, nz_row: int) -> torch.Tensor:
+def _get_nz_col_index_from_row_uint32(activation: torch.Tensor, nz_row: int) -> torch.Tensor:
     idx = torch.nonzero(activation[nz_row] != 0, as_tuple=False).flatten()
-    return idx.to(dtype=torch.int64)
+    return idx.to(dtype=torch.uint32)
 
+def _get_nz_col_index_from_row_int32(activation: torch.Tensor, nz_row: int) -> torch.Tensor:
+    idx = torch.nonzero(activation[nz_row] != 0, as_tuple=False).flatten()
+    return idx.to(dtype=torch.int32)
 
 def _mean_op_output(
     op,
@@ -67,7 +70,7 @@ def check_correctness(sparsity: float, repeats: int, seed: int) -> None:
     print("测试1: 正确性验证")
     print("=" * 60)
 
-    load_sve_sparse_gemv_extension(verbose=False)
+    load_sve_sparse_gemm_extension(verbose=False)
     kernel = SVESparseGEMVKernel.initialize(name="sve_sparse_gemv", target="CPU")
     op = kernel.operator(compiled=True)
 
@@ -78,10 +81,10 @@ def check_correctness(sparsity: float, repeats: int, seed: int) -> None:
 
     # 选择一行和对应的非零列索引
     nz_row = 2
-    nz_col_index = _get_nz_col_index_from_row(activation, nz_row)
+    nz_col_index = _get_nz_col_index_from_row_uint32(activation, nz_row)
     if nz_col_index.numel() == 0:
         # 避免全零导致的退化情况：强制保留一个非零位置
-        nz_col_index = torch.tensor([0], dtype=torch.int64)
+        nz_col_index = torch.tensor([0], dtype=torch.int32)
         activation[nz_row, 0] = 1.0
 
     # 多次调用算子，结果取均值
@@ -120,8 +123,9 @@ def test_sparse_pattern() -> None:
 
     # 设置稀疏模式：只有特定位置有非零值
     nz_row = 1
-    nz_col_index = torch.tensor([0, 2, 4, 6, 8], dtype=torch.int64)
+    nz_col_index = torch.tensor([0, 2, 4, 6, 8], dtype=torch.int32)
     activation[nz_row, nz_col_index] = torch.randn(len(nz_col_index))
+    nz_col_index = nz_col_index.to(dtype=torch.uint32)
 
     result_sve = op(activation, weight, nz_row, nz_col_index)
 
@@ -151,7 +155,7 @@ def test_edge_cases() -> None:
     activation = torch.zeros(3, 5, dtype=torch.float32)
     weight = torch.randn(5, 4, dtype=torch.float32)
     activation[1, 2] = 1.0
-    nz_col_index = torch.tensor([2], dtype=torch.int64)
+    nz_col_index = torch.tensor([2], dtype=torch.uint32)
     result = op(activation, weight, 1, nz_col_index)
     expected = weight[2, :]
     assert torch.allclose(result, expected), "单个元素测试失败"
@@ -161,7 +165,8 @@ def test_edge_cases() -> None:
     print("测试3.2: 所有元素都是非零")
     activation = torch.randn(2, 4, dtype=torch.float32)
     weight = torch.randn(4, 4, dtype=torch.float32)
-    nz_col_index = torch.arange(4, dtype=torch.int64)
+    nz_col_index = torch.arange(4, dtype=torch.int32)
+    nz_col_index = nz_col_index.to(dtype=torch.uint32)
     result = op(activation, weight, 0, nz_col_index)
     expected = torch.matmul(activation[0:1, :], weight).squeeze(0)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "全非零测试失败"
@@ -173,9 +178,10 @@ def test_edge_cases() -> None:
     weight = torch.randn(5,4, dtype=torch.float32)
     activation[0, 1] = 0.0  # 设置为0
     activation[0, 3] = 0.0  # 设置为0
-    nz_col_index = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
+    nz_col_index = torch.tensor([0, 1, 2, 3, 4], dtype=torch.uint32)
     result = op(activation, weight, 0, nz_col_index)
     # 参考结果应该排除零值
+    nz_col_index = nz_col_index.to(dtype=torch.int32)
     act_row = activation[0, nz_col_index]
     mask = act_row != 0.0
     valid_indices = nz_col_index[mask]
@@ -194,7 +200,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     print("\n" + "=" * 60)
     print("测试4: 性能测试")
     print("=" * 60)
-    torch.set_num_threads(1)
+    # torch.set_num_threads(6)
 
     kernel = SVESparseGEMVKernel.initialize(name="sve_sparse_gemv", target="CPU")
     op = kernel.operator(compiled=True)
@@ -205,26 +211,23 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     weight = torch.randn(K, N, dtype=torch.float32)
 
     nz_row = 0
-    nz_col_index = _get_nz_col_index_from_row(activation, nz_row)
-    # if nz_col_index.numel() == 0:
-    #     nz_col_index = torch.tensor([0], dtype=torch.int64)
-    #     activation[nz_row, 0] = 1.0
-
+    nz_col_index = _get_nz_col_index_from_row_uint32(activation, nz_row)
     # 测试SVE算子性能
     def sve_fn():
-        nz_col_index = _get_nz_col_index_from_row(activation, nz_row)
+        nz_col_index = _get_nz_col_index_from_row_uint32(activation, nz_row)
         return op(activation, weight, nz_row, nz_col_index)
 
     lat_sve = measure_latency(sve_fn, warmup=10, iters=100)
     print(f"⏱️  SVE算子平均延迟: {lat_sve:.4f} ms")
     print(f"   输入形状: activation={activation.shape}, weight={weight.shape}")
     nnz = int(nz_col_index.numel())
+    nz_col_index = nz_col_index.to(dtype=torch.int32)
     print(f"   稀疏度(sparsity): {sparsity:.3f}")
     print(f"   非零元素数: {nnz}/{K} ({100*nnz/K:.1f}%)")
 
     # 对比PyTorch标准实现
     def pytorch_fn0():
-        nz_col_index = _get_nz_col_index_from_row(activation, nz_row)
+        nz_col_index = _get_nz_col_index_from_row_int32(activation, nz_row)
         act_nz = activation[nz_row, nz_col_index]
         w_nz = weight[nz_col_index, :]
         return (act_nz.unsqueeze(0) @ w_nz).squeeze(0)
@@ -262,7 +265,7 @@ def test_direct_torch_ops() -> None:
     print("测试5: 直接使用 torch.ops 调用")
     print("=" * 60)
 
-    load_sve_sparse_gemv_extension(verbose=False)
+    load_sve_sparse_gemm_extension(verbose=False)
 
     # 直接使用 torch.ops 调用
     M, K, N = 5, 8, 4
@@ -270,7 +273,7 @@ def test_direct_torch_ops() -> None:
     weight = torch.randn(K, N, dtype=torch.float32)
 
     nz_row = 2
-    nz_col_index = _get_nz_col_index_from_row(activation, nz_row)
+    nz_col_index = _get_nz_col_index_from_row_uint32(activation, nz_row)
     
     result_direct = torch.ops.teal.sve_sparse_gemv(
         activation, weight, nz_row, nz_col_index
@@ -295,7 +298,7 @@ def test_direct_torch_ops() -> None:
 def main() -> None:
     """运行所有测试"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sparsity", type=float, default=0.5, help="activation 置零比例(0~1)")
+    parser.add_argument("--sparsity", type=float, default=0.65, help="activation 置零比例(0~1)")
     parser.add_argument("--repeats", type=int, default=5, help="正确性测试重复调用次数并取均值")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     args = parser.parse_args()
