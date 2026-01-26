@@ -103,6 +103,7 @@ class SVECSCGEMMKernel(BaseKernel):
         weight: torch.Tensor,
         nz_counts: torch.Tensor,
         nz_col_indices: torch.Tensor,
+        mask: torch.Tensor,
         ncore: int = 0,
     ) -> torch.Tensor:
         M = activation.size(0)
@@ -115,11 +116,12 @@ class SVECSCGEMMKernel(BaseKernel):
         weight: torch.Tensor,
         nz_counts: torch.Tensor,
         nz_col_indices: torch.Tensor,
+        mask: torch.Tensor,
         ncore: int = 0,
     ) -> torch.Tensor:
         load_sve_csc_gemm_extension()
         return torch.ops.teal_csc.sve_csc_gemm(
-            activation, weight, nz_counts, nz_col_indices, ncore
+            activation, weight, nz_counts, nz_col_indices, mask, ncore
         )
 
 
@@ -158,6 +160,7 @@ def sve_csc_gemm(
     weight: torch.Tensor,
     nz_counts: torch.Tensor,
     nz_col_indices: torch.Tensor,
+    mask: torch.Tensor,
     ncore: int = 0,
 ) -> torch.Tensor:
     """
@@ -175,5 +178,5 @@ def sve_csc_gemm(
     """
     load_sve_csc_gemm_extension()
     return torch.ops.teal_csc.sve_csc_gemm(
-        activation, weight, nz_counts, nz_col_indices, ncore
+        activation, weight, nz_counts, nz_col_indices, mask, ncore
     )

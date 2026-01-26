@@ -43,15 +43,21 @@ def _make_random_sparse_activation(
     return x * keep
 
 
-def _get_sparse_indices_uint32(activation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _get_sparse_indices_uint32(
+    activation: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     从稀疏 activation 中提取非零元素的索引信息。
     
     Returns:
         nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
         nz_col_indices: 扁平化的列索引向量
+        mask: 与 activation 同形状的 uint32 Tensor，0xFFFFFFFF 表示 True，0 表示 False
     """
     M, K = activation.shape
+    mask_bool = activation.ne(0)
+    # uint32 mask: all-ones=true, zero=false
+    mask = (mask_bool.to(torch.uint32) * torch.tensor(0xFFFFFFFF, dtype=torch.uint32))
     nz_pairs = []
     nz_col_indices = []
     
@@ -65,7 +71,7 @@ def _get_sparse_indices_uint32(activation: torch.Tensor) -> tuple[torch.Tensor, 
     nz_counts = torch.tensor(nz_pairs, dtype=torch.int64)
     nz_col_indices = torch.cat(nz_col_indices, dim=0).to(dtype=torch.uint32) if len(nz_col_indices) > 0 else torch.tensor([], dtype=torch.uint32)
     
-    return nz_counts, nz_col_indices
+    return nz_counts, nz_col_indices, mask
 
 
 def check_correctness(sparsity: float, seed: int) -> None:
@@ -84,10 +90,10 @@ def check_correctness(sparsity: float, seed: int) -> None:
     weight = torch.randn(K, N, dtype=torch.float32)
 
     # 获取稀疏索引
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
+    nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
     
     # 调用算子
-    result_sve = op(activation, weight, nz_counts, nz_col_indices, 0)
+    result_sve = op(activation, weight, nz_counts, nz_col_indices, mask, 0)
 
     # 参考计算：直接使用 PyTorch 的 matmul
     result_ref = torch.matmul(activation, weight)
@@ -129,11 +135,14 @@ def test_sparse_pattern() -> None:
     # row 3 全零
     activation[4, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]] = torch.randn(10)  # 全非零
 
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result_sve = op(activation, weight, nz_counts, nz_col_indices, 0)
+    nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
+    result_sve = op(activation, weight, nz_counts, nz_col_indices, mask, 0)
 
     # 参考计算
     result_ref = torch.matmul(activation, weight)
+    print(f"CSC结果:\n{result_sve}")
+    print(f"参考结果:\n{result_ref}")
+    print(f"差异:\n{result_sve - result_ref}")
 
     if torch.allclose(result_sve, result_ref, rtol=1e-4, atol=1e-5):
         print("✅ 稀疏模式测试通过")
@@ -156,8 +165,8 @@ def test_edge_cases() -> None:
     activation = torch.zeros(1, 5, dtype=torch.float32)
     weight = torch.randn(5, 4, dtype=torch.float32)
     activation[0, 2] = 1.5
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices, 0)
+    nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
+    result = op(activation, weight, nz_counts, nz_col_indices, mask, 0)
     expected = torch.matmul(activation, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "单行单元素测试失败"
     print("  ✅ 通过")
@@ -166,8 +175,8 @@ def test_edge_cases() -> None:
     print("测试3.2: 全零矩阵")
     activation = torch.zeros(3, 4, dtype=torch.float32)
     weight = torch.randn(4, 5, dtype=torch.float32)
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices, 0)
+    nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
+    result = op(activation, weight, nz_counts, nz_col_indices, mask, 0)
     expected = torch.zeros(3, 5, dtype=torch.float32)
     assert torch.allclose(result, expected), "全零矩阵测试失败"
     print("  ✅ 通过")
@@ -176,8 +185,8 @@ def test_edge_cases() -> None:
     print("测试3.3: 全非零矩阵")
     activation = torch.randn(4, 6, dtype=torch.float32)
     weight = torch.randn(6, 8, dtype=torch.float32)
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices, 0)
+    nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
+    result = op(activation, weight, nz_counts, nz_col_indices, mask, 0)
     expected = torch.matmul(activation, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "全非零矩阵测试失败"
     print("  ✅ 通过")
@@ -191,8 +200,8 @@ def test_edge_cases() -> None:
     activation[2, :] = torch.randn(8)   # 8 个非零
     activation[3, :0] = torch.randn(0)  # 0 个非零
     activation[4, :5] = torch.randn(5)  # 5 个非零
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices, 0)
+    nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
+    result = op(activation, weight, nz_counts, nz_col_indices, mask, 0)
     expected = torch.matmul(activation, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "不同非零数测试失败"
     print("  ✅ 通过")
@@ -209,17 +218,17 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     op = kernel.operator(compiled=True)
 
     # 创建较大的测试数据（模拟实际场景）
-    M, K, N = 1, 11008, 4096
+    M, K, N = 1, 4096, 11008
     activation = _make_random_sparse_activation(M, K, sparsity=sparsity, seed=seed)
     weight = torch.randn(K, N, dtype=torch.float32)
 
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
 
     # 测试CSC算子性能
     def csc_fn():
-        return op(activation, weight, nz_counts, nz_col_indices, 0)
+        nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
+        return op(activation, weight, nz_counts, nz_col_indices, mask, 0)
 
-    lat_csc = measure_latency(csc_fn, warmup=10, iters=10000)
+    lat_csc = measure_latency(csc_fn, warmup=10, iters=1000)
     print(f"⏱️  CSC GEMM 算子平均延迟: {lat_csc:.4f} ms")
     print(f"   输入形状: activation={activation.shape}, weight={weight.shape}")
     print(f"   稀疏度(sparsity): {sparsity:.3f}")
@@ -230,7 +239,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     def pytorch_dense_fn():
         return torch.matmul(activation, weight)
 
-    lat_pytorch_dense = measure_latency(pytorch_dense_fn, warmup=10, iters=10000)
+    lat_pytorch_dense = measure_latency(pytorch_dense_fn, warmup=10, iters=100)
     print(f"⏱️  PyTorch 稠密 matmul 平均延迟: {lat_pytorch_dense:.4f} ms")
     if lat_csc > 0:
         print(f"   加速比: {lat_pytorch_dense/lat_csc:.2f}x")
@@ -240,10 +249,17 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
         sp_act = activation.to_sparse_csr()
         return torch.sparse.mm(sp_act, weight)
 
-    lat_pytorch_sparse = measure_latency(pytorch_sparse_fn, warmup=10, iters=10000)
+    lat_pytorch_sparse = measure_latency(pytorch_sparse_fn, warmup=10, iters=100)
     print(f"⏱️  PyTorch 稀疏 CSR + sparse.mm 平均延迟: {lat_pytorch_sparse:.4f} ms")
     if lat_csc > 0:
         print(f"   加速比: {lat_pytorch_sparse/lat_csc:.2f}x")
+    if torch.allclose(csc_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
+        print("✅ CSC GEMM 算子正确性测试通过")
+    else:
+        print("❌ CSC GEMM 算子正确性测试失败")
+        print(f"CSC结果:\n{csc_fn()}")
+        print(f"参考结果:\n{torch.matmul(activation, weight)}")
+        print(f"差异:\n{csc_fn() - torch.matmul(activation, weight)}")
 
 
 def test_direct_torch_ops() -> None:
@@ -259,10 +275,10 @@ def test_direct_torch_ops() -> None:
     activation = _make_random_sparse_activation(M, K, sparsity=0.9, seed=0)
     weight = torch.randn(K, N, dtype=torch.float32)
 
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
+    nz_counts, nz_col_indices, mask = _get_sparse_indices_uint32(activation)
     
     result_direct = torch.ops.teal_csc.sve_csc_gemm(
-        activation, weight, nz_counts, nz_col_indices, 0
+        activation, weight, nz_counts, nz_col_indices, mask, 0
     )
 
     # 参考计算
@@ -278,7 +294,7 @@ def test_direct_torch_ops() -> None:
 def main() -> None:
     """运行所有测试"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sparsity", type=float, default=0.90, help="activation 置零比例(0~1)")
+    parser.add_argument("--sparsity", type=float, default=0.8, help="activation 置零比例(0~1)")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     args = parser.parse_args()
 

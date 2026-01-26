@@ -58,13 +58,17 @@ def load_sve_sparse_gemm_extension(
         and hasattr(torch.ops, "teal")
         and hasattr(torch.ops.teal, "sve_sparse_gemv")
         and hasattr(torch.ops.teal, "sve_sparse_gemm")
+        and hasattr(torch.ops.teal, "sve_sparse_act_csr_gemm")
     ):
         return None
 
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     return load(
         name=EXT_NAME,
-        sources=[str(CPP_ROOT / "sve_sparse_gemm_op.cpp")],
+        sources=[
+            str(CPP_ROOT / "sve_sparse_gemm_op.cpp"),
+            str(CPP_ROOT / "sve_sparse_act_csr_gemm_op.cpp"),
+        ],
         build_directory=str(BUILD_DIR),
         extra_cflags=_extra_cflags(),
         extra_ldflags=_extra_ldflags(),
@@ -133,6 +137,48 @@ class SVESparseGEMMKernel(BaseKernel):
         return torch.ops.teal.sve_sparse_gemm(activation, weight, nz_counts, nz_col_indices)
 
 
+class SVESparseActCSRGEMMKernel(BaseKernel):
+    """
+    torch.compile 兼容的 CSR activation（gather 构建）GEMM wrapper。
+
+    该算子输入与 `sve_sparse_gemm` 一致，但内部会：
+    - gather activation 非零值 -> CSR(values, col_idx, row_ptr)
+    - CSR × dense weight 得到输出
+
+    Args:
+        activation: (M, K) 稀疏激活矩阵（以稠密格式传入）
+        weight: (K, N) 稠密权重矩阵
+        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
+        nz_col_indices: 扁平化的列索引向量（uint32/int32）
+
+    Returns:
+        output: (M, N) 输出矩阵
+    """
+
+    def meta(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        M = activation.size(0)
+        N = weight.size(1)
+        return activation.new_empty((M, N), device="meta")
+
+    def forward(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        load_sve_sparse_gemm_extension()
+        return torch.ops.teal.sve_sparse_act_csr_gemm(
+            activation, weight, nz_counts, nz_col_indices
+        )
+
+
 def measure_latency(
     fn: Callable[[], torch.Tensor],
     warmup: int = 20,
@@ -160,3 +206,19 @@ def measure_latency(
     t1 = time.perf_counter()
 
     return (t1 - t0) * 1000.0 / iters
+
+
+# 便捷函数：直接调用算子
+def sve_sparse_act_csr_gemm(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    nz_counts: torch.Tensor,
+    nz_col_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    直接调用 CSR activation（gather 构建）GEMM 算子的便捷函数。
+    """
+    load_sve_sparse_gemm_extension()
+    return torch.ops.teal.sve_sparse_act_csr_gemm(
+        activation, weight, nz_counts, nz_col_indices
+    )

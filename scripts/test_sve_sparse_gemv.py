@@ -298,7 +298,7 @@ def test_direct_torch_ops() -> None:
 def main() -> None:
     """运行所有测试"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sparsity", type=float, default=0.65, help="activation 置零比例(0~1)")
+    parser.add_argument("--sparsity", type=float, default=0.80, help="activation 置零比例(0~1)")
     parser.add_argument("--repeats", type=int, default=5, help="正确性测试重复调用次数并取均值")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     args = parser.parse_args()
