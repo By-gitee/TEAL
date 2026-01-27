@@ -27,7 +27,7 @@ def _make_random_sparse_activation(
     seed: int,
 ) -> torch.Tensor:
     """
-    生成随机稀疏 activation（float32）。
+    生成随机稀疏 activation（float32），并让**行间稀疏度不均匀**。
 
     sparsity: 稀疏度(0~1)，表示置零比例；0=全非零，1=全为零。
     """
@@ -41,7 +41,21 @@ def _make_random_sparse_activation(
     if sparsity >= 1.0:
         return torch.zeros(M, K, dtype=torch.float32)
 
-    keep = (torch.rand(M, K, generator=g) >= sparsity).to(torch.float32)
+    # 目标整体非零比例（keep 概率）
+    target_keep = 1.0 - float(sparsity)
+
+    # 为每一行采样不同的 keep 概率（围绕 target_keep 波动），再做一次缩放让整体均值更接近目标
+    # 对于 sparsity≈0.9（keep≈0.1），std≈0.08 会产生明显的行间差异：有的行更稀疏、有的行更密集。
+    std_keep = max(0.02, target_keep * 0.8)
+    row_keep = torch.normal(
+        mean=torch.full((M,), target_keep, dtype=torch.float32),
+        std=std_keep,
+        generator=g,
+    ).clamp_(0.0, 1.0)
+    if float(row_keep.mean()) > 0.0:
+        row_keep = (row_keep * (target_keep / row_keep.mean())).clamp_(0.0, 1.0)
+
+    keep = (torch.rand(M, K, generator=g) < row_keep[:, None]).to(torch.float32)
     return x * keep
 
 
@@ -220,7 +234,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     op = kernel.operator(compiled=True)
 
     # 创建较大的测试数据（模拟实际场景）
-    M, K, N = 256, 4096, 11008
+    M, K, N = 128, 4096, 11008
     activation = _make_random_sparse_activation(M, K, sparsity=sparsity, seed=seed)
     weight = torch.randn(K, N, dtype=torch.float32)
 
@@ -230,7 +244,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
         return op(activation, weight, nz_counts, nz_col_indices)
 
     lat_csr = measure_latency(csr_fn, warmup=10, iters=100)
-    print(f"⏱️  CSR(Gather) GEMM 算子平均延迟: {lat_csr:.4f} ms")
+    print(f"⏱️  CSR GEMM 算子平均延迟: {lat_csr:.4f} ms")
     print(f"   输入形状: activation={activation.shape}, weight={weight.shape}")
     print(f"   稀疏度(sparsity): {sparsity:.3f}")
 
@@ -256,9 +270,9 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
         print(f"   加速比: {lat_pytorch_sparse/lat_csr:.2f}x")
 
     if torch.allclose(csr_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
-        print("✅ CSR(Gather) GEMM 算子正确性测试通过")
+        print("✅ CSR GEMM 算子正确性测试通过")
     else:
-        print("❌ CSR(Gather) GEMM 算子正确性测试失败")
+        print("❌ CSR GEMM 算子正确性测试失败")
         print(f"CSR结果:\n{csr_fn()}")
         print(f"参考结果:\n{torch.matmul(activation, weight)}")
         print(f"差异:\n{csr_fn() - torch.matmul(activation, weight)}")
@@ -296,7 +310,7 @@ def test_direct_torch_ops() -> None:
 def main() -> None:
     """运行所有测试"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sparsity", type=float, default=0.95, help="activation 置零比例(0~1)")
+    parser.add_argument("--sparsity", type=float, default=0.8, help="activation 置零比例(0~1)")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     args = parser.parse_args()
 

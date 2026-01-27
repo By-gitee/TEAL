@@ -242,7 +242,7 @@ torch::Tensor sve_csc_gemm(
         act_ptr, counts_ptr, indices_ptr, mask_ptr, M, K, num_nz_rows);
     
     // 步骤 2：并行计算（按输出列 N 切块，避免不同线程写同一 output 元素的数据竞争）
-    constexpr int64_t N_TILE = 1024;  // 可调：越大线程数越少，越小调度开销越大
+    constexpr int64_t N_TILE = 688;  // 可调：越大线程数越少，越小调度开销越大
     #pragma omp parallel for schedule(static) num_threads((int)nthreads)
     for (int64_t n0 = 0; n0 < N; n0 += N_TILE) {
         const int64_t n1 = std::min<int64_t>(N, n0 + N_TILE);

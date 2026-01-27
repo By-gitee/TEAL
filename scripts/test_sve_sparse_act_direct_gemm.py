@@ -1,8 +1,8 @@
 """
-ARM SVE 稀疏 GEMM 算子的正确性与性能测试。
+ARM SVE 直接稀疏 GEMM 算子的正确性与性能测试。
 
 运行方式:
-    python -m scripts.test_sve_sparse_gemm
+    python -m scripts.test_sve_sparse_act_direct_gemm
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import argparse
 import torch
 
 from kernels.sve_sparse_gemm import (
-    SVESparseGEMMKernel,
+    SVESparseActDirectGEMMKernel,
     load_sve_sparse_gemm_extension,
     measure_latency,
 )
@@ -97,7 +97,7 @@ def check_correctness(sparsity: float, seed: int) -> None:
     print("=" * 60)
 
     load_sve_sparse_gemm_extension(verbose=False)
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseActDirectGEMMKernel.initialize(name="sve_sparse_act_direct_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 创建测试数据
@@ -137,7 +137,7 @@ def test_sparse_pattern() -> None:
     print("测试2: 稀疏模式验证")
     print("=" * 60)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseActDirectGEMMKernel.initialize(name="sve_sparse_act_direct_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     M, K, N = 5, 10, 4
@@ -170,7 +170,7 @@ def test_edge_cases() -> None:
     print("测试3: 边界情况")
     print("=" * 60)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseActDirectGEMMKernel.initialize(name="sve_sparse_act_direct_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 测试1: 单行单元素
@@ -227,11 +227,11 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     print("=" * 60)
     # torch.set_num_threads(1)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseActDirectGEMMKernel.initialize(name="sve_sparse_act_direct_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 创建较大的测试数据（模拟实际场景）
-    M, K, N = 128, 4096, 11008
+    M, K, N = 1, 4096, 11008
     activation = _make_random_sparse_activation(M, K, sparsity=sparsity, seed=seed)
     weight = torch.randn(K, N, dtype=torch.float32)
 
@@ -242,7 +242,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
         return op(activation, weight, nz_counts, nz_col_indices)
 
     lat_sve = measure_latency(sve_fn, warmup=10, iters=100)
-    print(f"⏱️  SVE GEMM 算子平均延迟: {lat_sve:.4f} ms")
+    print(f"⏱️  SVE Direct GEMM 算子平均延迟: {lat_sve:.4f} ms")
     print(f"   输入形状: activation={activation.shape}, weight={weight.shape}")
     print(f"   稀疏度(sparsity): {sparsity:.3f}")
     # print(f"   非零元素数: {nnz}/{M*K} ({100*nnz/(M*K):.1f}%)")
@@ -271,9 +271,9 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
         print(f"   加速比: {lat_pytorch_sparse/lat_sve:.2f}x")
 
     if torch.allclose(sve_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
-        print("✅ SVE GEMM 算子正确性测试通过")
+        print("✅ SVE Direct GEMM 算子正确性测试通过")
     else:
-        print("❌ SVE GEMM 算子正确性测试失败")
+        print("❌ SVE Direct GEMM 算子正确性测试失败")
         print(f"SVE结果:\n{sve_fn()}")
         print(f"参考结果:\n{torch.matmul(activation, weight)}")
         print(f"差异:\n{sve_fn() - torch.matmul(activation, weight)}")
@@ -294,7 +294,7 @@ def test_direct_torch_ops() -> None:
 
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
     
-    result_direct = torch.ops.teal.sve_sparse_gemm(
+    result_direct = torch.ops.teal.sve_sparse_act_direct_gemm(
         activation, weight, nz_counts, nz_col_indices
     )
 

@@ -1,8 +1,10 @@
 """
-ARM SVE 稀疏 GEMM 算子的正确性与性能测试。
+ARM SVE CSR（连续 load activation）稀疏 GEMM 算子的正确性与性能测试。
+
+测试输出与测试方式对齐 `scripts/test_sve_sparse_gemm.py`。
 
 运行方式:
-    python -m scripts.test_sve_sparse_gemm
+    python -m scripts.test_sve_sparse_csr_gemm
 """
 
 from __future__ import annotations
@@ -11,9 +13,10 @@ import argparse
 import torch
 
 from kernels.sve_sparse_gemm import (
-    SVESparseGEMMKernel,
+    SVESparseCSRGEMMKernel,
     load_sve_sparse_gemm_extension,
     measure_latency,
+    sve_sparse_csr_gemm,
 )
 
 
@@ -24,7 +27,7 @@ def _make_random_sparse_activation(
     seed: int,
 ) -> torch.Tensor:
     """
-    生成随机稀疏 activation（float32）。
+    生成随机稀疏 activation（float32），并让**行间稀疏度不均匀**。
 
     sparsity: 稀疏度(0~1)，表示置零比例；0=全非零，1=全为零。
     """
@@ -38,57 +41,54 @@ def _make_random_sparse_activation(
     if sparsity >= 1.0:
         return torch.zeros(M, K, dtype=torch.float32)
 
-    keep = (torch.rand(M, K, generator=g) >= sparsity).to(torch.float32)
+    # 目标整体非零比例（keep 概率）
+    target_keep = 1.0 - float(sparsity)
+
+    # 为每一行采样不同的 keep 概率（围绕 target_keep 波动），再做一次缩放让整体均值更接近目标
+    # 对于 sparsity≈0.9（keep≈0.1），std≈0.08 会产生明显的行间差异：有的行更稀疏、有的行更密集。
+    std_keep = max(0.02, target_keep * 0.8)
+    row_keep = torch.normal(
+        mean=torch.full((M,), target_keep, dtype=torch.float32),
+        std=std_keep,
+        generator=g,
+    ).clamp_(0.0, 1.0)
+    if float(row_keep.mean()) > 0.0:
+        row_keep = (row_keep * (target_keep / row_keep.mean())).clamp_(0.0, 1.0)
+
+    keep = (torch.rand(M, K, generator=g) < row_keep[:, None]).to(torch.float32)
     return x * keep
 
 
-def _get_sparse_indices(activation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _get_sparse_indices_uint32(
+    activation: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     从稀疏 activation 中提取非零元素的索引信息。
-    
+
     Returns:
         nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
-        nz_col_indices: 扁平化的列索引向量
+        nz_col_indices: 扁平化的列索引向量（uint32）
     """
-    M, K = activation.shape
+    M, _K = activation.shape
     nz_pairs = []
     nz_col_indices = []
-    
+
     for m in range(M):
         row = activation[m]
         nz_idx = torch.nonzero(row != 0, as_tuple=False).flatten()
         if len(nz_idx) > 0:
             nz_pairs.extend([m, len(nz_idx)])
             nz_col_indices.append(nz_idx)
-    
+
     nz_counts = torch.tensor(nz_pairs, dtype=torch.int64)
-    nz_col_indices = torch.cat(nz_col_indices, dim=0).to(dtype=torch.int64) if len(nz_col_indices) > 0 else torch.tensor([], dtype=torch.int64)
-    
+    nz_col_indices = (
+        torch.cat(nz_col_indices, dim=0).to(dtype=torch.uint32)
+        if len(nz_col_indices) > 0
+        else torch.tensor([], dtype=torch.uint32)
+    )
+
     return nz_counts, nz_col_indices
 
-def _get_sparse_indices_uint32(activation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    从稀疏 activation 中提取非零元素的索引信息。
-    
-    Returns:
-        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
-        nz_col_indices: 扁平化的列索引向量
-    """
-    M, K = activation.shape
-    nz_pairs = []
-    nz_col_indices = []
-    
-    for m in range(M):
-        row = activation[m]
-        nz_idx = torch.nonzero(row != 0, as_tuple=False).flatten()
-        if len(nz_idx) > 0:
-            nz_pairs.extend([m, len(nz_idx)])
-            nz_col_indices.append(nz_idx)
-    
-    nz_counts = torch.tensor(nz_pairs, dtype=torch.int64)
-    nz_col_indices = torch.cat(nz_col_indices, dim=0).to(dtype=torch.uint32) if len(nz_col_indices) > 0 else torch.tensor([], dtype=torch.uint32)
-    
-    return nz_counts, nz_col_indices
 
 def check_correctness(sparsity: float, seed: int) -> None:
     """测试算子的正确性"""
@@ -97,7 +97,7 @@ def check_correctness(sparsity: float, seed: int) -> None:
     print("=" * 60)
 
     load_sve_sparse_gemm_extension(verbose=False)
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseCSRGEMMKernel.initialize(name="sve_sparse_csr_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 创建测试数据
@@ -107,7 +107,7 @@ def check_correctness(sparsity: float, seed: int) -> None:
 
     # 获取稀疏索引
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    
+
     # 调用算子
     result_sve = op(activation, weight, nz_counts, nz_col_indices)
 
@@ -126,7 +126,7 @@ def check_correctness(sparsity: float, seed: int) -> None:
         print("✅ 正确性测试通过")
     else:
         print("❌ 正确性测试失败")
-        print(f"SVE结果:\n{result_sve}")
+        print(f"CSR-GEMM结果:\n{result_sve}")
         print(f"参考结果:\n{result_ref}")
         print(f"差异:\n{result_sve - result_ref}")
 
@@ -137,7 +137,7 @@ def test_sparse_pattern() -> None:
     print("测试2: 稀疏模式验证")
     print("=" * 60)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseCSRGEMMKernel.initialize(name="sve_sparse_csr_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     M, K, N = 5, 10, 4
@@ -156,6 +156,9 @@ def test_sparse_pattern() -> None:
 
     # 参考计算
     result_ref = torch.matmul(activation, weight)
+    print(f"CSR-GEMM结果:\n{result_sve}")
+    print(f"参考结果:\n{result_ref}")
+    print(f"差异:\n{result_sve - result_ref}")
 
     if torch.allclose(result_sve, result_ref, rtol=1e-4, atol=1e-5):
         print("✅ 稀疏模式测试通过")
@@ -170,7 +173,7 @@ def test_edge_cases() -> None:
     print("测试3: 边界情况")
     print("=" * 60)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseCSRGEMMKernel.initialize(name="sve_sparse_csr_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 测试1: 单行单元素
@@ -210,7 +213,7 @@ def test_edge_cases() -> None:
     weight = torch.randn(8, 6, dtype=torch.float32)
     activation[0, :1] = torch.randn(1)  # 1 个非零
     activation[1, :3] = torch.randn(3)  # 3 个非零
-    activation[2, :] = torch.randn(8)   # 8 个非零
+    activation[2, :] = torch.randn(8)  # 8 个非零
     activation[3, :0] = torch.randn(0)  # 0 个非零
     activation[4, :5] = torch.randn(5)  # 5 个非零
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
@@ -227,7 +230,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     print("=" * 60)
     # torch.set_num_threads(1)
 
-    kernel = SVESparseGEMMKernel.initialize(name="sve_sparse_gemm", target="CPU")
+    kernel = SVESparseCSRGEMMKernel.initialize(name="sve_sparse_csr_gemm", target="CPU")
     op = kernel.operator(compiled=True)
 
     # 创建较大的测试数据（模拟实际场景）
@@ -235,30 +238,26 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     activation = _make_random_sparse_activation(M, K, sparsity=sparsity, seed=seed)
     weight = torch.randn(K, N, dtype=torch.float32)
 
-
-    # 测试SVE算子性能
-    def sve_fn():
+    # 测试 CSR-GEMM 算子性能
+    def csr_fn():
         nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
         return op(activation, weight, nz_counts, nz_col_indices)
 
-    lat_sve = measure_latency(sve_fn, warmup=10, iters=100)
-    print(f"⏱️  SVE GEMM 算子平均延迟: {lat_sve:.4f} ms")
+    lat_csr = measure_latency(csr_fn, warmup=10, iters=100)
+    print(f"⏱️  CSR(连续 load) GEMM 算子平均延迟: {lat_csr:.4f} ms")
     print(f"   输入形状: activation={activation.shape}, weight={weight.shape}")
     print(f"   稀疏度(sparsity): {sparsity:.3f}")
-    # print(f"   非零元素数: {nnz}/{M*K} ({100*nnz/(M*K):.1f}%)")
 
     # 对比PyTorch标准实现：直接 matmul
-    # weight = torch.randn(N, K, dtype=torch.float32)
-    torch.backends.mkldnn.enabled = True 
+    torch.backends.mkldnn.enabled = True
 
     def pytorch_dense_fn():
         return torch.matmul(activation, weight)
 
-
     lat_pytorch_dense = measure_latency(pytorch_dense_fn, warmup=10, iters=100)
     print(f"⏱️  PyTorch 稠密 matmul 平均延迟: {lat_pytorch_dense:.4f} ms")
-    if lat_sve > 0:
-        print(f"   加速比: {lat_pytorch_dense/lat_sve:.2f}x")
+    if lat_csr > 0:
+        print(f"   加速比: {lat_pytorch_dense/lat_csr:.2f}x")
 
     # 对比PyTorch稀疏实现：to_sparse_csr + sparse.mm
     def pytorch_sparse_fn():
@@ -267,16 +266,16 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
 
     lat_pytorch_sparse = measure_latency(pytorch_sparse_fn, warmup=10, iters=100)
     print(f"⏱️  PyTorch 稀疏 CSR + sparse.mm 平均延迟: {lat_pytorch_sparse:.4f} ms")
-    if lat_sve > 0:
-        print(f"   加速比: {lat_pytorch_sparse/lat_sve:.2f}x")
+    if lat_csr > 0:
+        print(f"   加速比: {lat_pytorch_sparse/lat_csr:.2f}x")
 
-    if torch.allclose(sve_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
-        print("✅ SVE GEMM 算子正确性测试通过")
+    if torch.allclose(csr_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
+        print("✅ CSR GEMM 算子正确性测试通过")
     else:
-        print("❌ SVE GEMM 算子正确性测试失败")
-        print(f"SVE结果:\n{sve_fn()}")
+        print("❌ CSR GEMM 算子正确性测试失败")
+        print(f"CSR结果:\n{csr_fn()}")
         print(f"参考结果:\n{torch.matmul(activation, weight)}")
-        print(f"差异:\n{sve_fn() - torch.matmul(activation, weight)}")
+        print(f"差异:\n{csr_fn() - torch.matmul(activation, weight)}")
 
 
 def test_direct_torch_ops() -> None:
@@ -293,8 +292,8 @@ def test_direct_torch_ops() -> None:
     weight = torch.randn(K, N, dtype=torch.float32)
 
     nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    
-    result_direct = torch.ops.teal.sve_sparse_gemm(
+
+    result_direct = torch.ops.teal.sve_sparse_csr_gemm(
         activation, weight, nz_counts, nz_col_indices
     )
 

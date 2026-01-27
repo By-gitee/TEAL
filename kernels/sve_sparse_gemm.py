@@ -59,6 +59,8 @@ def load_sve_sparse_gemm_extension(
         and hasattr(torch.ops.teal, "sve_sparse_gemv")
         and hasattr(torch.ops.teal, "sve_sparse_gemm")
         and hasattr(torch.ops.teal, "sve_sparse_act_csr_gemm")
+        and hasattr(torch.ops.teal, "sve_sparse_csr_gemm")
+        and hasattr(torch.ops.teal, "sve_sparse_act_direct_gemm")
     ):
         return None
 
@@ -68,6 +70,8 @@ def load_sve_sparse_gemm_extension(
         sources=[
             str(CPP_ROOT / "sve_sparse_gemm_op.cpp"),
             str(CPP_ROOT / "sve_sparse_act_csr_gemm_op.cpp"),
+            str(CPP_ROOT / "sve_sparse_csr_gemm_op.cpp"),
+            str(CPP_ROOT / "sve_sparse_act_direct_gemm_op.cpp"),
         ],
         build_directory=str(BUILD_DIR),
         extra_cflags=_extra_cflags(),
@@ -208,6 +212,48 @@ def measure_latency(
     return (t1 - t0) * 1000.0 / iters
 
 
+class SVESparseCSRGEMMKernel(BaseKernel):
+    """
+    torch.compile 兼容的 CSR GEMM wrapper（使用 sve_sparse_gemm 风格的计算）。
+
+    该算子输入与 `sve_sparse_gemm` 一致，但内部会：
+    - 构建 CSR 格式的 activation
+    - 从 CSR values 连续 load，使用 gather load weight 进行计算
+
+    Args:
+        activation: (M, K) 稀疏激活矩阵（以稠密格式传入）
+        weight: (K, N) 稠密权重矩阵
+        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
+        nz_col_indices: 扁平化的列索引向量（uint32/int32）
+
+    Returns:
+        output: (M, N) 输出矩阵
+    """
+
+    def meta(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        M = activation.size(0)
+        N = weight.size(1)
+        return activation.new_empty((M, N), device="meta")
+
+    def forward(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        load_sve_sparse_gemm_extension()
+        return torch.ops.teal.sve_sparse_csr_gemm(
+            activation, weight, nz_counts, nz_col_indices
+        )
+
+
 # 便捷函数：直接调用算子
 def sve_sparse_act_csr_gemm(
     activation: torch.Tensor,
@@ -220,5 +266,78 @@ def sve_sparse_act_csr_gemm(
     """
     load_sve_sparse_gemm_extension()
     return torch.ops.teal.sve_sparse_act_csr_gemm(
+        activation, weight, nz_counts, nz_col_indices
+    )
+
+
+def sve_sparse_csr_gemm(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    nz_counts: torch.Tensor,
+    nz_col_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    直接调用 CSR GEMM 算子的便捷函数（使用 sve_sparse_gemm 风格的计算）。
+    """
+    load_sve_sparse_gemm_extension()
+    return torch.ops.teal.sve_sparse_csr_gemm(
+        activation, weight, nz_counts, nz_col_indices
+    )
+
+
+class SVESparseActDirectGEMMKernel(BaseKernel):
+    """
+    torch.compile 兼容的直接 GEMM wrapper（不构建 CSR 格式）。
+
+    该算子输入与 `sve_sparse_gemm` 一致，但内部会：
+    - 直接使用 nz_counts / nz_col_indices + activation 进行 GEMM 计算
+    - 不构建 CSR 格式，直接从 activation 取值
+    - 计算过程中使用 SIMD（SVE）加速
+
+    Args:
+        activation: (M, K) 稀疏激活矩阵（以稠密格式传入）
+        weight: (K, N) 稠密权重矩阵
+        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
+        nz_col_indices: 扁平化的列索引向量（uint32/int32）
+
+    Returns:
+        output: (M, N) 输出矩阵
+    """
+
+    def meta(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        M = activation.size(0)
+        N = weight.size(1)
+        return activation.new_empty((M, N), device="meta")
+
+    def forward(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        nz_counts: torch.Tensor,
+        nz_col_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        load_sve_sparse_gemm_extension()
+        return torch.ops.teal.sve_sparse_act_direct_gemm(
+            activation, weight, nz_counts, nz_col_indices
+        )
+
+
+def sve_sparse_act_direct_gemm(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    nz_counts: torch.Tensor,
+    nz_col_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    直接调用直接 GEMM 算子的便捷函数（不构建 CSR 格式）。
+    """
+    load_sve_sparse_gemm_extension()
+    return torch.ops.teal.sve_sparse_act_direct_gemm(
         activation, weight, nz_counts, nz_col_indices
     )
