@@ -231,7 +231,7 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     op = kernel.operator(compiled=True)
 
     # 创建较大的测试数据（模拟实际场景）
-    M, K, N = 128, 4096, 11008
+    M, K, N = 1, 4096, 11008
     activation = _make_random_sparse_activation(M, K, sparsity=sparsity, seed=seed)
     weight = torch.randn(K, N, dtype=torch.float32)
 
@@ -269,6 +269,16 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     print(f"⏱️  PyTorch 稀疏 CSR + sparse.mm 平均延迟: {lat_pytorch_sparse:.4f} ms")
     if lat_sve > 0:
         print(f"   加速比: {lat_pytorch_sparse/lat_sve:.2f}x")
+
+    # 对比PyTorch稀疏实现：to_sparse_csc + sparse.mm
+    def pytorch_sparse_csc_fn():
+        sp_act = activation.to_sparse_csc()
+        return torch.sparse.mm(sp_act, weight)
+
+    lat_pytorch_sparse_csc = measure_latency(pytorch_sparse_csc_fn, warmup=10, iters=100)
+    print(f"⏱️  PyTorch 稀疏 CSC + sparse.mm 平均延迟: {lat_pytorch_sparse_csc:.4f} ms")
+    if lat_sve > 0:
+        print(f"   加速比: {lat_pytorch_sparse_csc/lat_sve:.2f}x")
 
     if torch.allclose(sve_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
         print("✅ SVE GEMM 算子正确性测试通过")

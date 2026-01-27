@@ -269,6 +269,17 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     if lat_csr > 0:
         print(f"   加速比: {lat_pytorch_sparse/lat_csr:.2f}x")
 
+        # 对比PyTorch稀疏实现：to_sparse_csc + sparse.mm
+    def pytorch_sparse_csc_fn():
+        sp_act = activation.to_sparse_csc()
+        return torch.sparse.mm(sp_act, weight)
+
+    lat_pytorch_sparse_csc = measure_latency(pytorch_sparse_csc_fn, warmup=10, iters=100)
+    print(f"⏱️  PyTorch 稀疏 CSC + sparse.mm 平均延迟: {lat_pytorch_sparse_csc:.4f} ms")
+    if lat_sve > 0:
+        print(f"   加速比: {lat_pytorch_sparse_csc/lat_sve:.2f}x")
+
+
     if torch.allclose(csr_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
         print("✅ CSR GEMM 算子正确性测试通过")
     else:

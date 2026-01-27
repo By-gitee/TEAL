@@ -248,6 +248,16 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
 
     # 常用稀疏基线：构造 1xK 的 sparse CSR，然后 sparse_mm 到 dense weight。
     # 注意：把 sparse 张量构造放到计时外，避免把构造开销混进 kernel 时间。
+    
+    # 对比PyTorch稀疏实现：to_sparse_csc + sparse.mm
+    def pytorch_sparse_csc_fn():
+        sp_act = activation.to_sparse_csc()
+        return torch.sparse.mm(sp_act, weight)
+
+    lat_pytorch_sparse_csc = measure_latency(pytorch_sparse_csc_fn, warmup=10, iters=100)
+    print(f"⏱️  PyTorch 稀疏 CSC + sparse.mm 平均延迟: {lat_pytorch_sparse_csc:.4f} ms")
+    if lat_sve > 0:
+        print(f"   加速比: {lat_pytorch_sparse_csc/lat_sve:.2f}x")
 
     def pytorch_fn2():
         sp_row = activation.to_sparse_csr()               # CSR
