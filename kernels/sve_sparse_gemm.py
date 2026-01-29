@@ -112,8 +112,8 @@ class SVESparseGEMMKernel(BaseKernel):
     Args:
         activation: (M, K) 稀疏激活矩阵
         weight: (K, N) 密集权重矩阵
-        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
-        nz_col_indices: 扁平化的列索引向量
+        row_offsets: int64 [M+1]，前缀和偏移量，row_offsets[m] 表示第 m 行在 nz_col_indices 中的起始位置
+        nz_col_indices: 扁平化的列索引向量（uint32）
     
     Returns:
         output: (M, N) 输出矩阵
@@ -123,7 +123,7 @@ class SVESparseGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         M = activation.size(0)
@@ -134,11 +134,11 @@ class SVESparseGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         load_sve_sparse_gemm_extension()
-        return torch.ops.teal.sve_sparse_gemm(activation, weight, nz_counts, nz_col_indices)
+        return torch.ops.teal.sve_sparse_gemm(activation, weight, row_offsets, nz_col_indices)
 
 
 class SVESparseActCSRGEMMKernel(BaseKernel):
@@ -152,7 +152,7 @@ class SVESparseActCSRGEMMKernel(BaseKernel):
     Args:
         activation: (M, K) 稀疏激活矩阵（以稠密格式传入）
         weight: (K, N) 稠密权重矩阵
-        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
+        row_offsets: int64 [M+1]，前缀和偏移量，row_offsets[m] 表示第 m 行在 nz_col_indices 中的起始位置
         nz_col_indices: 扁平化的列索引向量（uint32/int32）
 
     Returns:
@@ -163,7 +163,7 @@ class SVESparseActCSRGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         M = activation.size(0)
@@ -174,12 +174,12 @@ class SVESparseActCSRGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         load_sve_sparse_gemm_extension()
         return torch.ops.teal.sve_sparse_act_csr_gemm(
-            activation, weight, nz_counts, nz_col_indices
+            activation, weight, row_offsets, nz_col_indices
         )
 
 
@@ -223,7 +223,7 @@ class SVESparseCSRGEMMKernel(BaseKernel):
     Args:
         activation: (M, K) 稀疏激活矩阵（以稠密格式传入）
         weight: (K, N) 稠密权重矩阵
-        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
+        row_offsets: int64 [M+1]，前缀和偏移量，row_offsets[m] 表示第 m 行在 nz_col_indices 中的起始位置
         nz_col_indices: 扁平化的列索引向量（uint32/int32）
 
     Returns:
@@ -234,7 +234,7 @@ class SVESparseCSRGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         M = activation.size(0)
@@ -245,12 +245,12 @@ class SVESparseCSRGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         load_sve_sparse_gemm_extension()
         return torch.ops.teal.sve_sparse_csr_gemm(
-            activation, weight, nz_counts, nz_col_indices
+            activation, weight, row_offsets, nz_col_indices
         )
 
 
@@ -258,7 +258,7 @@ class SVESparseCSRGEMMKernel(BaseKernel):
 def sve_sparse_act_csr_gemm(
     activation: torch.Tensor,
     weight: torch.Tensor,
-    nz_counts: torch.Tensor,
+    row_offsets: torch.Tensor,
     nz_col_indices: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -266,14 +266,14 @@ def sve_sparse_act_csr_gemm(
     """
     load_sve_sparse_gemm_extension()
     return torch.ops.teal.sve_sparse_act_csr_gemm(
-        activation, weight, nz_counts, nz_col_indices
+        activation, weight, row_offsets, nz_col_indices
     )
 
 
 def sve_sparse_csr_gemm(
     activation: torch.Tensor,
     weight: torch.Tensor,
-    nz_counts: torch.Tensor,
+    row_offsets: torch.Tensor,
     nz_col_indices: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -281,7 +281,7 @@ def sve_sparse_csr_gemm(
     """
     load_sve_sparse_gemm_extension()
     return torch.ops.teal.sve_sparse_csr_gemm(
-        activation, weight, nz_counts, nz_col_indices
+        activation, weight, row_offsets, nz_col_indices
     )
 
 
@@ -289,15 +289,15 @@ class SVESparseActDirectGEMMKernel(BaseKernel):
     """
     torch.compile 兼容的直接 GEMM wrapper（不构建 CSR 格式）。
 
-    该算子输入与 `sve_sparse_gemm` 一致，但内部会：
-    - 直接使用 nz_counts / nz_col_indices + activation 进行 GEMM 计算
+    该算子输入格式与 `sve_sparse_gemm` 一致（row_offsets + nz_col_indices），但内部会：
+    - 直接使用 row_offsets / nz_col_indices + activation 进行 GEMM 计算
     - 不构建 CSR 格式，直接从 activation 取值
     - 计算过程中使用 SIMD（SVE）加速
 
     Args:
         activation: (M, K) 稀疏激活矩阵（以稠密格式传入）
         weight: (K, N) 稠密权重矩阵
-        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
+        row_offsets: 前缀和数组，长度为 M+1，表示每行在 nz_col_indices 中的起始位置
         nz_col_indices: 扁平化的列索引向量（uint32/int32）
 
     Returns:
@@ -308,7 +308,7 @@ class SVESparseActDirectGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         M = activation.size(0)
@@ -319,25 +319,131 @@ class SVESparseActDirectGEMMKernel(BaseKernel):
         self,
         activation: torch.Tensor,
         weight: torch.Tensor,
-        nz_counts: torch.Tensor,
+        row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
         load_sve_sparse_gemm_extension()
         return torch.ops.teal.sve_sparse_act_direct_gemm(
-            activation, weight, nz_counts, nz_col_indices
+            activation, weight, row_offsets, nz_col_indices
         )
 
 
 def sve_sparse_act_direct_gemm(
     activation: torch.Tensor,
     weight: torch.Tensor,
-    nz_counts: torch.Tensor,
+    row_offsets: torch.Tensor,
     nz_col_indices: torch.Tensor,
 ) -> torch.Tensor:
     """
     直接调用直接 GEMM 算子的便捷函数（不构建 CSR 格式）。
+    
+    Args:
+        activation: (M, K) 稀疏激活矩阵（以稠密格式传入）
+        weight: (K, N) 稠密权重矩阵
+        row_offsets: 前缀和数组，长度为 M+1，表示每行在 nz_col_indices 中的起始位置
+        nz_col_indices: 扁平化的列索引向量（uint32/int32）
+    
+    Returns:
+        output: (M, N) 输出矩阵
     """
     load_sve_sparse_gemm_extension()
     return torch.ops.teal.sve_sparse_act_direct_gemm(
-        activation, weight, nz_counts, nz_col_indices
+        activation, weight, row_offsets, nz_col_indices
     )
+
+
+# kernels/sve_sparse_gemm.py
+
+import os
+import torch
+from torch.utils.cpp_extension import load
+
+_row_scan_sve_ext = None
+
+def load_row_scan_sve_extension(verbose: bool = False):
+    global _row_scan_sve_ext
+    if _row_scan_sve_ext is not None:
+        return _row_scan_sve_ext
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.join(this_dir, "cpp_sve_sparse_gemm")
+    src = os.path.join(cpp_dir, "row_scan_sve_op.cpp")
+
+    extra_cflags = [
+        "-O3",
+        "-fopenmp",
+        "-march=armv8-a+sve2",
+        "-ffast-math",
+    ]
+    extra_ldflags = [
+        "-fopenmp",
+        # 如果你的环境需要，取消下一行注释：
+        # "-lgomp",
+    ]
+
+    _row_scan_sve_ext = load(
+        name="row_scan_sve_ext",
+        sources=[src],
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
+        with_cuda=False,
+        verbose=verbose,
+    )
+    return _row_scan_sve_ext
+
+
+def row_scan_sve(activation: torch.Tensor, threshold: float, verbose: bool = False):
+    ext = load_row_scan_sve_extension(verbose=verbose)
+    return ext.row_scan_sve(activation, float(threshold))
+
+
+# Naive version (parallel but no SVE)
+_row_scan_naive_ext = None
+
+def load_row_scan_naive_extension(verbose: bool = False):
+    global _row_scan_naive_ext
+    if _row_scan_naive_ext is not None:
+        return _row_scan_naive_ext
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.join(this_dir, "cpp_sve_sparse_gemm")
+    src = os.path.join(cpp_dir, "row_scan_naive_op.cpp")
+
+    # 朴素版本不需要 SVE 相关标志，但保留 OpenMP 并行支持
+    if os.name == "nt":
+        # Windows/MSVC
+        extra_cflags = ["/std:c++17", "/openmp"]
+        extra_ldflags = []
+    else:
+        # Linux/macOS
+        extra_cflags = ["-std=c++17", "-O3", "-fopenmp"]
+        extra_ldflags = ["-fopenmp"]
+
+    _row_scan_naive_ext = load(
+        name="row_scan_naive_ext",
+        sources=[src],
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
+        with_cuda=False,
+        verbose=verbose,
+    )
+    return _row_scan_naive_ext
+
+
+def row_scan_naive(activation: torch.Tensor, threshold: float, verbose: bool = False):
+    """
+    朴素版本的行扫描算子（使用 OpenMP 并行，但不使用 SVE 加速）。
+    
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        threshold: float，阈值，绝对值大于等于该值的元素被视为非零
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (nz_counts, nz_col_indices, row_offsets)
+            - nz_counts: int64 tensor，长度为 2 * num_nz_rows，成对存储 (row_idx, count)
+            - nz_col_indices: uint32 tensor，扁平化的列索引向量
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+    """
+    ext = load_row_scan_naive_extension(verbose=verbose)
+    return ext.row_scan_naive(activation, float(threshold))

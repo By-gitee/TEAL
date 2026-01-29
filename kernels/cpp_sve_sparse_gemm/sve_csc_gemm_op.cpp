@@ -12,7 +12,7 @@
 #endif
 
 /**
- * CSC (Compressed Sparse Column) 格式的稀疏矩阵乘法算子
+ * CSC (Compressed Sparse Column) 格式的稀疏矩阵乘法算子（废弃）
  * 
  * 输入：
  *   - activation: (M, K) 原始稠密 activation 矩阵

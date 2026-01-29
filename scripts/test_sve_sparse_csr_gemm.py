@@ -17,80 +17,69 @@ from kernels.sve_sparse_gemm import (
     load_sve_sparse_gemm_extension,
     measure_latency,
     sve_sparse_csr_gemm,
+    row_scan_sve,
 )
 
 
 def _make_random_sparse_activation(
     M: int,
     K: int,
-    sparsity: float,
     seed: int,
 ) -> torch.Tensor:
     """
-    生成随机稀疏 activation（float32），并让**行间稀疏度不均匀**。
-
-    sparsity: 稀疏度(0~1)，表示置零比例；0=全非零，1=全为零。
+    生成随机 activation 矩阵（float32）。
+    注意：此函数仅生成初始矩阵，稀疏化处理在 _get_sparse_indices 函数中通过 threshold 完成。
     """
-    assert 0.0 <= sparsity <= 1.0
     g = torch.Generator()
     g.manual_seed(seed)
-
     x = torch.randn(M, K, dtype=torch.float32, generator=g)
-    if sparsity <= 0.0:
-        return x
-    if sparsity >= 1.0:
-        return torch.zeros(M, K, dtype=torch.float32)
-
-    # 目标整体非零比例（keep 概率）
-    target_keep = 1.0 - float(sparsity)
-
-    # 为每一行采样不同的 keep 概率（围绕 target_keep 波动），再做一次缩放让整体均值更接近目标
-    # 对于 sparsity≈0.9（keep≈0.1），std≈0.08 会产生明显的行间差异：有的行更稀疏、有的行更密集。
-    std_keep = max(0.02, target_keep * 0.8)
-    row_keep = torch.normal(
-        mean=torch.full((M,), target_keep, dtype=torch.float32),
-        std=std_keep,
-        generator=g,
-    ).clamp_(0.0, 1.0)
-    if float(row_keep.mean()) > 0.0:
-        row_keep = (row_keep * (target_keep / row_keep.mean())).clamp_(0.0, 1.0)
-
-    keep = (torch.rand(M, K, generator=g) < row_keep[:, None]).to(torch.float32)
-    return x * keep
+    return x
 
 
-def _get_sparse_indices_uint32(
-    activation: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _get_sparse_indices_uint32(activation: torch.Tensor, threshold: float = 0.0) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    从稀疏 activation 中提取非零元素的索引信息。
-
+    从 activation 中提取大于 threshold 的元素的索引信息。
+    
+    Args:
+        activation: 输入的 activation 矩阵
+        threshold: 阈值，大于此值的元素将被保留
+    
     Returns:
-        nz_counts: 成对存储的 (row_idx, count)，长度为 2 * num_nz_rows
+        row_offsets: int64 [M+1]，前缀和偏移量，row_offsets[m] 表示第 m 行在 nz_col_indices 中的起始位置
         nz_col_indices: 扁平化的列索引向量（uint32）
     """
-    M, _K = activation.shape
-    nz_pairs = []
+    M, K = activation.shape
+    row_offsets = [0]
     nz_col_indices = []
-
+    
     for m in range(M):
         row = activation[m]
-        nz_idx = torch.nonzero(row != 0, as_tuple=False).flatten()
-        if len(nz_idx) > 0:
-            nz_pairs.extend([m, len(nz_idx)])
-            nz_col_indices.append(nz_idx)
-
-    nz_counts = torch.tensor(nz_pairs, dtype=torch.int64)
-    nz_col_indices = (
-        torch.cat(nz_col_indices, dim=0).to(dtype=torch.uint32)
-        if len(nz_col_indices) > 0
-        else torch.tensor([], dtype=torch.uint32)
-    )
-
-    return nz_counts, nz_col_indices
+        # 与 threshold 比较，保留大于 threshold 的元素
+        nz_idx = torch.nonzero(row > threshold, as_tuple=False).flatten()
+        nz_col_indices.append(nz_idx.to(dtype=torch.uint32))
+        row_offsets.append(row_offsets[-1] + len(nz_idx))
+    
+    row_offsets_t = torch.tensor(row_offsets, dtype=torch.int64)
+    nz_col_indices_t = torch.cat(nz_col_indices, dim=0) if len(nz_col_indices) > 0 else torch.tensor([], dtype=torch.uint32)
+    
+    return row_offsets_t, nz_col_indices_t
 
 
-def check_correctness(sparsity: float, seed: int) -> None:
+def _apply_threshold(activation: torch.Tensor, threshold: float = 0.0) -> torch.Tensor:
+    """
+    对 activation 矩阵应用阈值，大于 threshold 的值保留，其余置零。
+    
+    Args:
+        activation: 输入的 activation 矩阵
+        threshold: 阈值
+    
+    Returns:
+        应用阈值后的 activation 矩阵
+    """
+    return torch.where(activation > threshold, activation, torch.zeros_like(activation))
+
+
+def check_correctness(seed: int, threshold: float = 0.0) -> None:
     """测试算子的正确性"""
     print("=" * 60)
     print("测试1: 正确性验证")
@@ -102,24 +91,25 @@ def check_correctness(sparsity: float, seed: int) -> None:
 
     # 创建测试数据
     M, K, N = 10, 8, 6
-    activation = _make_random_sparse_activation(M, K, sparsity=sparsity, seed=seed)
+    activation = _make_random_sparse_activation(M, K, seed=seed)
     weight = torch.randn(K, N, dtype=torch.float32)
 
-    # 获取稀疏索引
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-
+    # 获取稀疏索引（基于 threshold）
+    row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+    
     # 调用算子
-    result_sve = op(activation, weight, nz_counts, nz_col_indices)
+    result_sve = op(activation, weight, row_offsets, nz_col_indices)
 
-    # 参考计算：直接使用 PyTorch 的 matmul
-    result_ref = torch.matmul(activation, weight)
+    # 参考计算：应用 threshold 后使用 PyTorch 的 matmul
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    result_ref = torch.matmul(activation_thresholded, weight)
 
     # 比较结果
     max_diff = torch.max(torch.abs(result_sve - result_ref)).item()
     mean_diff = torch.mean(torch.abs(result_sve - result_ref)).item()
     print(f"最大误差: {max_diff:.6e}")
     print(f"平均误差: {mean_diff:.6e}")
-    print(f"稀疏度(sparsity): {sparsity:.3f}")
+    print(f"阈值(threshold): {threshold:.6f}")
     print(f"总非零元素数: {int(nz_col_indices.numel())}/{M*K} ({100*nz_col_indices.numel()/(M*K):.1f}%)")
 
     if torch.allclose(result_sve, result_ref, rtol=1e-4, atol=1e-5):
@@ -131,7 +121,7 @@ def check_correctness(sparsity: float, seed: int) -> None:
         print(f"差异:\n{result_sve - result_ref}")
 
 
-def test_sparse_pattern() -> None:
+def test_sparse_pattern(threshold: float = 0.0) -> None:
     """测试特定稀疏模式"""
     print("\n" + "=" * 60)
     print("测试2: 稀疏模式验证")
@@ -151,11 +141,12 @@ def test_sparse_pattern() -> None:
     # row 3 全零
     activation[4, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]] = torch.randn(10)  # 全非零
 
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result_sve = op(activation, weight, nz_counts, nz_col_indices)
+    row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+    result_sve = op(activation, weight, row_offsets, nz_col_indices)
 
     # 参考计算
-    result_ref = torch.matmul(activation, weight)
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    result_ref = torch.matmul(activation_thresholded, weight)
     print(f"CSR-GEMM结果:\n{result_sve}")
     print(f"参考结果:\n{result_ref}")
     print(f"差异:\n{result_sve - result_ref}")
@@ -167,7 +158,7 @@ def test_sparse_pattern() -> None:
         print(f"最大误差: {torch.max(torch.abs(result_sve - result_ref)).item():.6e}")
 
 
-def test_edge_cases() -> None:
+def test_edge_cases(threshold: float = 0.0) -> None:
     """测试边界情况"""
     print("\n" + "=" * 60)
     print("测试3: 边界情况")
@@ -181,9 +172,10 @@ def test_edge_cases() -> None:
     activation = torch.zeros(1, 5, dtype=torch.float32)
     weight = torch.randn(5, 4, dtype=torch.float32)
     activation[0, 2] = 1.5
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
-    expected = torch.matmul(activation, weight)
+    row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+    result = op(activation, weight, row_offsets, nz_col_indices)
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    expected = torch.matmul(activation_thresholded, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "单行单元素测试失败"
     print("  ✅ 通过")
 
@@ -191,9 +183,10 @@ def test_edge_cases() -> None:
     print("测试3.2: 全零矩阵")
     activation = torch.zeros(3, 4, dtype=torch.float32)
     weight = torch.randn(4, 5, dtype=torch.float32)
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
-    expected = torch.zeros(3, 5, dtype=torch.float32)
+    row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+    result = op(activation, weight, row_offsets, nz_col_indices)
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    expected = torch.matmul(activation_thresholded, weight)
     assert torch.allclose(result, expected), "全零矩阵测试失败"
     print("  ✅ 通过")
 
@@ -201,9 +194,10 @@ def test_edge_cases() -> None:
     print("测试3.3: 全非零矩阵")
     activation = torch.randn(4, 6, dtype=torch.float32)
     weight = torch.randn(6, 8, dtype=torch.float32)
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
-    expected = torch.matmul(activation, weight)
+    row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+    result = op(activation, weight, row_offsets, nz_col_indices)
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    expected = torch.matmul(activation_thresholded, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "全非零矩阵测试失败"
     print("  ✅ 通过")
 
@@ -213,17 +207,18 @@ def test_edge_cases() -> None:
     weight = torch.randn(8, 6, dtype=torch.float32)
     activation[0, :1] = torch.randn(1)  # 1 个非零
     activation[1, :3] = torch.randn(3)  # 3 个非零
-    activation[2, :] = torch.randn(8)  # 8 个非零
+    activation[2, :] = torch.randn(8)   # 8 个非零
     activation[3, :0] = torch.randn(0)  # 0 个非零
     activation[4, :5] = torch.randn(5)  # 5 个非零
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-    result = op(activation, weight, nz_counts, nz_col_indices)
-    expected = torch.matmul(activation, weight)
+    row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+    result = op(activation, weight, row_offsets, nz_col_indices)
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    expected = torch.matmul(activation_thresholded, weight)
     assert torch.allclose(result, expected, rtol=1e-4, atol=1e-5), "不同非零数测试失败"
     print("  ✅ 通过")
 
 
-def benchmark_performance(sparsity: float, seed: int) -> None:
+def benchmark_performance(seed: int, threshold: float = 0.0) -> None:
     """性能测试"""
     print("\n" + "=" * 60)
     print("测试4: 性能测试")
@@ -234,25 +229,26 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     op = kernel.operator(compiled=True)
 
     # 创建较大的测试数据（模拟实际场景）
-    M, K, N = 128, 4096, 11008
-    activation = _make_random_sparse_activation(M, K, sparsity=sparsity, seed=seed)
+    M, K, N = 1, 4096, 11008
+    activation = _make_random_sparse_activation(M, K, seed=seed)
     weight = torch.randn(K, N, dtype=torch.float32)
 
     # 测试 CSR-GEMM 算子性能
     def csr_fn():
-        nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-        return op(activation, weight, nz_counts, nz_col_indices)
+        row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+        return op(activation, weight, row_offsets, nz_col_indices)
 
     lat_csr = measure_latency(csr_fn, warmup=10, iters=100)
     print(f"⏱️  CSR(连续 load) GEMM 算子平均延迟: {lat_csr:.4f} ms")
     print(f"   输入形状: activation={activation.shape}, weight={weight.shape}")
-    print(f"   稀疏度(sparsity): {sparsity:.3f}")
+    print(f"   阈值(threshold): {threshold:.6f}")
 
-    # 对比PyTorch标准实现：直接 matmul
+    # 对比PyTorch标准实现：应用 threshold 后 matmul
     torch.backends.mkldnn.enabled = True
 
     def pytorch_dense_fn():
-        return torch.matmul(activation, weight)
+        activation_thresholded = _apply_threshold(activation, threshold=threshold)
+        return torch.matmul(activation_thresholded, weight)
 
     lat_pytorch_dense = measure_latency(pytorch_dense_fn, warmup=10, iters=100)
     print(f"⏱️  PyTorch 稠密 matmul 平均延迟: {lat_pytorch_dense:.4f} ms")
@@ -261,7 +257,8 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
 
     # 对比PyTorch稀疏实现：to_sparse_csr + sparse.mm
     def pytorch_sparse_fn():
-        sp_act = activation.to_sparse_csr()
+        activation_thresholded = _apply_threshold(activation, threshold=threshold)
+        sp_act = activation_thresholded.to_sparse_csr()
         return torch.sparse.mm(sp_act, weight)
 
     lat_pytorch_sparse = measure_latency(pytorch_sparse_fn, warmup=10, iters=100)
@@ -272,7 +269,8 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     
     # 对比PyTorch稀疏实现：to_sparse_csc + sparse.mm
     def pytorch_sparse_csc_fn():
-        sp_act = activation.to_sparse_csc()
+        activation_thresholded = _apply_threshold(activation, threshold=threshold)
+        sp_act = activation_thresholded.to_sparse_csc()
         return torch.sparse.mm(sp_act, weight)
 
     lat_pytorch_sparse_csc = measure_latency(pytorch_sparse_csc_fn, warmup=10, iters=100)
@@ -280,16 +278,18 @@ def benchmark_performance(sparsity: float, seed: int) -> None:
     if lat_csr > 0:
         print(f"   加速比: {lat_pytorch_sparse_csc/lat_csr:.2f}x")
 
-    if torch.allclose(csr_fn(), torch.matmul(activation, weight), rtol=1e-3, atol=1e-3):
+    # 正确性验证
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    if torch.allclose(csr_fn(), torch.matmul(activation_thresholded, weight), rtol=1e-3, atol=1e-3):
         print("✅ CSR GEMM 算子正确性测试通过")
     else:
         print("❌ CSR GEMM 算子正确性测试失败")
         print(f"CSR结果:\n{csr_fn()}")
-        print(f"参考结果:\n{torch.matmul(activation, weight)}")
-        print(f"差异:\n{csr_fn() - torch.matmul(activation, weight)}")
+        print(f"参考结果:\n{torch.matmul(activation_thresholded, weight)}")
+        print(f"差异:\n{csr_fn() - torch.matmul(activation_thresholded, weight)}")
 
 
-def test_direct_torch_ops() -> None:
+def test_direct_torch_ops(threshold: float = 0.0) -> None:
     """测试直接使用 torch.ops 调用"""
     print("\n" + "=" * 60)
     print("测试5: 直接使用 torch.ops 调用")
@@ -299,17 +299,18 @@ def test_direct_torch_ops() -> None:
 
     # 直接使用 torch.ops 调用
     M, K, N = 5, 8, 4
-    activation = _make_random_sparse_activation(M, K, sparsity=0.9, seed=0)
+    activation = _make_random_sparse_activation(M, K, seed=0)
     weight = torch.randn(K, N, dtype=torch.float32)
 
-    nz_counts, nz_col_indices = _get_sparse_indices_uint32(activation)
-
+    row_offsets, nz_col_indices = _get_sparse_indices_uint32(activation, threshold=threshold)
+    
     result_direct = torch.ops.teal.sve_sparse_csr_gemm(
-        activation, weight, nz_counts, nz_col_indices
+        activation, weight, row_offsets, nz_col_indices
     )
 
-    # 参考计算
-    result_ref = torch.matmul(activation, weight)
+    # 参考计算：应用 threshold 后 matmul
+    activation_thresholded = _apply_threshold(activation, threshold=threshold)
+    result_ref = torch.matmul(activation_thresholded, weight)
 
     if torch.allclose(result_direct, result_ref, rtol=1e-4, atol=1e-5):
         print("✅ torch.ops 直接调用测试通过")
@@ -321,16 +322,16 @@ def test_direct_torch_ops() -> None:
 def main() -> None:
     """运行所有测试"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sparsity", type=float, default=0.8, help="activation 置零比例(0~1)")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
+    parser.add_argument("--threshold", type=float, default=0.8, help="阈值，大于此值的元素将被保留")
     args = parser.parse_args()
 
     try:
-        check_correctness(sparsity=args.sparsity, seed=args.seed)
-        test_sparse_pattern()
-        test_edge_cases()
-        test_direct_torch_ops()
-        benchmark_performance(sparsity=args.sparsity, seed=args.seed + 1)
+        check_correctness(seed=args.seed, threshold=args.threshold)
+        test_sparse_pattern(threshold=args.threshold)
+        test_edge_cases(threshold=args.threshold)
+        test_direct_torch_ops(threshold=args.threshold)
+        benchmark_performance(seed=args.seed + 1, threshold=args.threshold)
         print("\n" + "=" * 60)
         print("✅ 所有测试完成")
         print("=" * 60)

@@ -160,42 +160,48 @@ torch::Tensor sve_sparse_gemv(
 void check_gemm_inputs(
     const torch::Tensor& activation,
     const torch::Tensor& weight,
-    const torch::Tensor& nz_counts,
+    const torch::Tensor& row_offsets,
     const torch::Tensor& nz_col_indices) {
   TORCH_CHECK(activation.device().is_cpu(), "activation must be a CPU tensor");
   TORCH_CHECK(weight.device().is_cpu(), "weight must be a CPU tensor");
-  TORCH_CHECK(nz_counts.device().is_cpu(), "nz_counts must be a CPU tensor");
+  TORCH_CHECK(row_offsets.device().is_cpu(), "row_offsets must be a CPU tensor");
   TORCH_CHECK(nz_col_indices.device().is_cpu(), "nz_col_indices must be a CPU tensor");
 
   TORCH_CHECK(activation.dtype() == torch::kFloat32, "activation must be float32");
   TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
-  TORCH_CHECK(nz_counts.dtype() == torch::kInt64, "nz_counts must be int64");
+  TORCH_CHECK(row_offsets.dtype() == torch::kInt64, "row_offsets must be int64");
   TORCH_CHECK(nz_col_indices.dtype() == torch::kUInt32, "nz_col_indices must be uint32");
 
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D");
   TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
-  TORCH_CHECK(nz_counts.dim() == 1, "nz_counts must be 1D");
+  TORCH_CHECK(row_offsets.dim() == 1, "row_offsets must be 1D");
   TORCH_CHECK(nz_col_indices.dim() == 1, "nz_col_indices must be 1D");
 
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
   TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
-  TORCH_CHECK(nz_counts.is_contiguous(), "nz_counts must be contiguous");
+  TORCH_CHECK(row_offsets.is_contiguous(), "row_offsets must be contiguous");
   TORCH_CHECK(nz_col_indices.is_contiguous(), "nz_col_indices must be contiguous");
 
+  const auto M = activation.size(0);
   const auto K = activation.size(1);
   TORCH_CHECK(weight.size(0) == K, "weight K dimension must match activation K");
-  TORCH_CHECK(nz_counts.size(0) % 2 == 0, "nz_counts length must be even (pairs of row_idx, count)");
+  TORCH_CHECK(row_offsets.size(0) == M + 1, "row_offsets length must be M+1");
+  
+  const int64_t* offsets_ptr = row_offsets.data_ptr<int64_t>();
+  TORCH_CHECK(offsets_ptr[0] == 0, "row_offsets[0] must be 0");
+  TORCH_CHECK(offsets_ptr[M] == nz_col_indices.numel(), 
+              "row_offsets[M] must equal nz_col_indices size");
 }
 
 // Sparse GEMM: (M, K) sparse × (K, N) dense → (M, N)
-// nz_counts: pairs of (row_idx, count) for rows with non-zero elements
+// row_offsets: int64 [M+1], prefix sum offsets for each row in nz_col_indices
 // nz_col_indices: flattened column indices for all non-zero elements
 torch::Tensor sve_sparse_gemm(
     torch::Tensor activation,
     torch::Tensor weight,
-    torch::Tensor nz_counts,
+    torch::Tensor row_offsets,
     torch::Tensor nz_col_indices) {
-  // check_gemm_inputs(activation, weight, nz_counts, nz_col_indices);
+  // check_gemm_inputs(activation, weight, row_offsets, nz_col_indices);
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
@@ -209,34 +215,9 @@ torch::Tensor sve_sparse_gemm(
 
   const float* act_ptr = activation.data_ptr<float>();
   const float* weight_ptr = weight.data_ptr<float>();
-  const int64_t* counts_ptr = nz_counts.data_ptr<int64_t>();
+  const int64_t* offsets_ptr = row_offsets.data_ptr<int64_t>();
   const uint32_t* indices_ptr = nz_col_indices.data_ptr<uint32_t>();
   float* out_ptr = output.data_ptr<float>();
-
-  // Parse nz_counts: pairs of (row_idx, count)
-  const int64_t num_nz_rows = nz_counts.size(0) / 2;
-  
-  // Build mapping from row index to offset in nz_col_indices
-  std::vector<int64_t> row_indices;
-  std::vector<int64_t> row_offsets;
-  int64_t cumulative_offset = 0;
-  
-  for (int64_t i = 0; i < num_nz_rows; ++i) {
-    const int64_t row_idx = counts_ptr[2 * i];
-    const int64_t count = counts_ptr[2 * i + 1];
-    
-    // TORCH_CHECK(row_idx >= 0 && row_idx < M, "row_idx out of range");
-    // TORCH_CHECK(count >= 0, "count must be non-negative");
-    
-    row_indices.push_back(row_idx);
-    row_offsets.push_back(cumulative_offset);
-    cumulative_offset += count;
-  }
-
-  // // Verify total non-zero count matches
-  // TORCH_CHECK(
-  //     nz_col_indices.numel() == cumulative_offset,
-  //     "nz_col_indices size must equal sum of counts in nz_counts");
 #if defined(__ARM_FEATURE_SVE)
   const int64_t vl = svcntw();
   const uint32_t N_u32 = (uint32_t)N;
@@ -249,16 +230,13 @@ torch::Tensor sve_sparse_gemm(
     #pragma omp parallel
     {
       #pragma omp for collapse(2) schedule(static)
-      for (int64_t row_idx = 0; row_idx < num_nz_rows; ++row_idx) {
+      for (int64_t m = 0; m < M; ++m) {
         for (int64_t n = 0; n < n_full; n += n_block_sz) {
-
-          const int64_t m = row_indices[row_idx];
-          const int64_t nnz = counts_ptr[2 * row_idx + 1];
+          const int64_t nnz = offsets_ptr[m + 1] - offsets_ptr[m];
           if (nnz == 0) continue;
 
           const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + row_offsets[row_idx];
-
+          const uint32_t* idx_ptr = indices_ptr + offsets_ptr[m];
           float* out_row_ptr = out_ptr + m * N;
           std::vector<float> acc(n_block_sz, 0.0f);
 
@@ -287,13 +265,12 @@ torch::Tensor sve_sparse_gemm(
 
       if (rem > 0) {
         #pragma omp for schedule(static)
-        for (int64_t row_idx = 0; row_idx < num_nz_rows; ++row_idx) {
-          const int64_t m = row_indices[row_idx];
-          const int64_t nnz = counts_ptr[2 * row_idx + 1];
+        for (int64_t m = 0; m < M; ++m) {
+          const int64_t nnz = offsets_ptr[m + 1] - offsets_ptr[m];
           if (nnz == 0) continue;
 
           const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + row_offsets[row_idx];
+          const uint32_t* idx_ptr = indices_ptr + offsets_ptr[m];
           float* out_row_ptr = out_ptr + m * N;
 
           const int64_t n_start = n_full;
@@ -326,7 +303,7 @@ torch::Tensor sve_sparse_gemm(
 
 TORCH_LIBRARY(teal, m) {
   m.def("sve_sparse_gemv(Tensor activation, Tensor weight, int nz_row, Tensor nz_col_index) -> Tensor");
-  m.def("sve_sparse_gemm(Tensor activation, Tensor weight, Tensor nz_counts, Tensor nz_col_indices) -> Tensor");
+  m.def("sve_sparse_gemm(Tensor activation, Tensor weight, Tensor row_offsets, Tensor nz_col_indices) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(teal, CPU, m) {
