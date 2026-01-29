@@ -447,3 +447,116 @@ def row_scan_naive(activation: torch.Tensor, threshold: float, verbose: bool = F
     """
     ext = load_row_scan_naive_extension(verbose=verbose)
     return ext.row_scan_naive(activation, float(threshold))
+
+
+# Dense to CSR SVE2 version
+_row_scan_sve_csr_ext = None
+
+def load_row_scan_sve_csr_extension(verbose: bool = False):
+    global _row_scan_sve_csr_ext
+    if _row_scan_sve_csr_ext is not None:
+        return _row_scan_sve_csr_ext
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.join(this_dir, "cpp_sve_sparse_gemm")
+    src = os.path.join(cpp_dir, "row_scan_sve_csr_op.cpp")
+
+    if os.name == "nt":
+        # Windows/MSVC
+        extra_cflags = ["/std:c++17", "/openmp"]
+        extra_ldflags = []
+    else:
+        # Linux/macOS
+        extra_cflags = [
+            "-std=c++17",
+            "-O3",
+            "-fopenmp",
+            "-march=armv8-a+sve2",
+            "-ffast-math",
+        ]
+        extra_ldflags = ["-fopenmp"]
+
+    _row_scan_sve_csr_ext = load(
+        name="row_scan_sve_csr_ext",
+        sources=[src],
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
+        with_cuda=False,
+        verbose=verbose,
+    )
+    return _row_scan_sve_csr_ext
+
+
+def dense_to_csr_sve2(activation: torch.Tensor, threshold: float, verbose: bool = False):
+    """
+    Dense activation to CSR format using SVE2 compact (CPU).
+    
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        threshold: float，阈值，绝对值大于等于该值的元素被视为非零
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (row_offsets, col_idx, values)
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+            - col_idx: uint32 tensor，列索引向量
+            - values: float32 tensor，非零元素值
+    """
+    ext = load_row_scan_sve_csr_extension(verbose=verbose)
+    return ext.dense_to_csr_sve2(activation, float(threshold))
+
+
+# Dense to CSR OpenMP version (no SVE)
+_row_scan_omp_csr_ext = None
+
+def load_row_scan_omp_csr_extension(verbose: bool = False):
+    global _row_scan_omp_csr_ext
+    if _row_scan_omp_csr_ext is not None:
+        return _row_scan_omp_csr_ext
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.join(this_dir, "cpp_sve_sparse_gemm")
+    src = os.path.join(cpp_dir, "row_scan_omp_csr_op.cpp")
+
+    if os.name == "nt":
+        # Windows/MSVC
+        extra_cflags = ["/std:c++17", "/openmp"]
+        extra_ldflags = []
+    else:
+        # Linux/macOS
+        extra_cflags = [
+            "-std=c++17",
+            "-O3",
+            "-fopenmp",
+            "-ffast-math",
+        ]
+        extra_ldflags = ["-fopenmp"]
+
+    _row_scan_omp_csr_ext = load(
+        name="row_scan_omp_csr_ext",
+        sources=[src],
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
+        with_cuda=False,
+        verbose=verbose,
+    )
+    return _row_scan_omp_csr_ext
+
+
+def dense_to_csr_omp(activation: torch.Tensor, threshold: float, verbose: bool = False):
+    """
+    Dense activation to CSR format using OpenMP parallelization (CPU, no SVE).
+    
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        threshold: float，阈值，绝对值大于等于该值的元素被视为非零
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (row_offsets, col_idx, values)
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+            - col_idx: uint32 tensor，列索引向量
+            - values: float32 tensor，非零元素值
+    """
+    ext = load_row_scan_omp_csr_extension(verbose=verbose)
+    return ext.dense_to_csr_omp(activation, float(threshold))

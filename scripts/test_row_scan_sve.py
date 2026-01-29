@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import torch
 
-from kernels.sve_sparse_gemm import row_scan_sve, measure_latency
+from kernels.sve_sparse_gemm import row_scan_sve, measure_latency, row_scan_naive
 
 
 def reference(act: torch.Tensor, thr: float):
@@ -227,15 +227,24 @@ def benchmark_performance(M: int, K: int, threshold: float, seed: int) -> None:
     def sve_fn():
         return row_scan_sve(act, threshold, verbose=False)
 
-    lat_sve = measure_latency(sve_fn, warmup=10, iters=1000000)
+    lat_sve = measure_latency(sve_fn, warmup=10, iters=1000)
     print(f"⏱️  SVE row_scan 算子平均延迟: {lat_sve:.4f} ms")
     print(f"   输入形状: activation={act.shape}")
     print(f"   阈值(threshold): {threshold:.3f}")
 
-    # 获取实际非零元素数用于显示
-    _, nz_col_indices, _ = row_scan_sve(act, threshold, verbose=False)
-    print(f"   总非零元素数: {nz_col_indices.numel()}/{M*K} ({100*nz_col_indices.numel()/(M*K):.1f}%)")
+    # 方法1-2: Naive 实现
+    def naive_fn():
+        return row_scan_naive(act, threshold, verbose=False)
 
+    lat_naive = measure_latency(naive_fn, warmup=10, iters=1000)
+    print(f"⏱️  方法1 - Naive row_scan 实现（OpenMP 并行，无 SVE）:")
+    print(f"   平均延迟: {lat_naive:.4f} ms")
+
+
+    speedup = lat_naive/lat_sve
+    print(f"   相对 SVE 的加速比: {speedup:.2f}x" + 
+          (f" (SVE 快 {speedup:.2f}x)" if speedup > 1.0 
+           else f" (SVE 慢 {1.0/speedup:.2f}x)"))
     # # 测试 Baseline (PyTorch) 实现性能
     # def baseline_fn():
     #     return baseline_get_sparse_indices(act, threshold)
@@ -279,13 +288,17 @@ def benchmark_indices_generation_comparison(M: int, K: int, threshold: float, se
     print(f"总非零元素数: {nnz}/{M*K} ({100*nnz/(M*K):.1f}%)")
     print()
 
-    # 方法1: SVE 实现
+    # 方法1-1: SVE 实现
     def sve_fn():
         return row_scan_sve(act, threshold, verbose=False)
 
     lat_sve = measure_latency(sve_fn, warmup=10, iters=50)
     print(f"⏱️  方法1 - SVE row_scan 实现:")
     print(f"   平均延迟: {lat_sve:.4f} ms")
+
+
+
+
 
     # 方法2: Baseline PyTorch 实现
     def baseline_fn():
@@ -365,7 +378,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--M", type=int, default=256, help="activation 行数")
     parser.add_argument("--K", type=int, default=4096, help="activation 列数")
-    parser.add_argument("--threshold", type=float, default=0.8, help="阈值")
+    parser.add_argument("--threshold", type=float, default=0.6, help="阈值")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     args = parser.parse_args()
 
