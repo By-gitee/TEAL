@@ -11,7 +11,7 @@
 #endif
 
 
-void check_gemv_inputs(
+void check_sparse_gemv_icsr_sve_gather_inputs(
     const torch::Tensor& activation,
     const torch::Tensor& weight,
     const torch::Tensor& nz_col_index,
@@ -40,12 +40,12 @@ void check_gemv_inputs(
 }
 
 
-torch::Tensor sve_sparse_gemv(
+torch::Tensor sparse_gemv_icsr_sve_gather(
     torch::Tensor activation,
     torch::Tensor weight,
     int64_t nz_row,
     torch::Tensor nz_col_index) {
-  check_gemv_inputs(activation, weight, nz_col_index, nz_row);
+  check_sparse_gemv_icsr_sve_gather_inputs(activation, weight, nz_col_index, nz_row);
 
   const auto K = weight.size(0);
   const auto N = weight.size(1);
@@ -69,8 +69,7 @@ torch::Tensor sve_sparse_gemv(
     const int64_t vl = svcntw();
     const uint32_t N_u32 = static_cast<uint32_t>(N);
 
-  if (vl == 4) {
-    // N-dimension blocking (aligned with sve_sparse_gemm's n_block_sz idea)
+    // N-dimension blocking (aligned with sparse_gemm_icsr_sve_gather's n_block_sz idea)
     int64_t n_block_sz = N / 16;
     if (n_block_sz < 4) {
       n_block_sz = 4;
@@ -86,16 +85,14 @@ torch::Tensor sve_sparse_gemv(
         std::vector<float> acc(n_block_sz, 0.0f);
         const float* base = weight_ptr + n;
 
-        for (int64_t i = 0; i < nnz; i += 4) {
+        for (int64_t i = 0; i < nnz; i += vl) {
           const svbool_t pg = svwhilelt_b32(i, nnz);
           const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
-          const svfloat32_t act_vals =
-              svld1_gather_u32index_f32(pg, act_row_ptr, idx);
+          const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
           const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);  // idx * N
 
           for (int64_t r = 0; r < n_block_sz; ++r) {
-            const svfloat32_t w_vals =
-                svld1_gather_u32index_f32(pg, base + r, w_index);
+            const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
             acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
           }
         }
@@ -112,17 +109,14 @@ torch::Tensor sve_sparse_gemv(
           const int64_t n_start = n_full;
           std::vector<float> acc(rem, 0.0f);
 
-          for (int64_t i = 0; i < nnz; i += 4) {
+          for (int64_t i = 0; i < nnz; i += vl) {
             const svbool_t pg = svwhilelt_b32(i, nnz);
             const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
-            const svfloat32_t act_vals =
-                svld1_gather_u32index_f32(pg, act_row_ptr, idx);
-            const svuint32_t w_index =
-                svmul_n_u32_x(pg, idx, N_u32);  // idx * N
+            const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
+            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);  // idx * N
 
             for (int64_t r = 0; r < rem; ++r) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(
-                  pg, weight_ptr + (n_start + r), w_index);
+              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, weight_ptr + (n_start + r), w_index);
               acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
             }
           }
@@ -135,7 +129,6 @@ torch::Tensor sve_sparse_gemv(
     }  
 
     return output;
-  }
 #endif
 
   // Scalar computation (used when SVE is unavailable or unsafe).
@@ -157,7 +150,7 @@ torch::Tensor sve_sparse_gemv(
 
 
 // Check inputs for sparse GEMM operation
-void check_gemm_inputs(
+void check_sparse_gemm_icsr_sve_gather_inputs(
     const torch::Tensor& activation,
     const torch::Tensor& weight,
     const torch::Tensor& row_offsets,
@@ -196,12 +189,12 @@ void check_gemm_inputs(
 // Sparse GEMM: (M, K) sparse × (K, N) dense → (M, N)
 // row_offsets: int64 [M+1], prefix sum offsets for each row in nz_col_indices
 // nz_col_indices: flattened column indices for all non-zero elements
-torch::Tensor sve_sparse_gemm(
+torch::Tensor sparse_gemm_icsr_sve_gather(
     torch::Tensor activation,
     torch::Tensor weight,
     torch::Tensor row_offsets,
     torch::Tensor nz_col_indices) {
-  // check_gemm_inputs(activation, weight, row_offsets, nz_col_indices);
+  check_sparse_gemm_icsr_sve_gather_inputs(activation, weight, row_offsets, nz_col_indices);
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
@@ -222,7 +215,6 @@ torch::Tensor sve_sparse_gemm(
   const int64_t vl = svcntw();
   const uint32_t N_u32 = (uint32_t)N;
   
-  if (vl == 4) {
     int64_t n_block_sz = N/16;
     const int64_t n_full = (N / n_block_sz) * n_block_sz;
     const int64_t rem = N - n_full;
@@ -240,7 +232,7 @@ torch::Tensor sve_sparse_gemm(
           float* out_row_ptr = out_ptr + m * N;
           std::vector<float> acc(n_block_sz, 0.0f);
 
-          for (int64_t i = 0; i < nnz; i += 4) {
+          for (int64_t i = 0; i < nnz; i += vl) {
             const svbool_t pg = svwhilelt_b32(i, nnz);
             const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
 
@@ -277,7 +269,7 @@ torch::Tensor sve_sparse_gemm(
           
           std::vector<float> acc(rem, 0.0f);
 
-          for (int64_t i = 0; i < nnz; i += 4) {
+          for (int64_t i = 0; i < nnz; i += vl) {
             const svbool_t pg = svwhilelt_b32(i, nnz);
             const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
             const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
@@ -295,20 +287,19 @@ torch::Tensor sve_sparse_gemm(
         }
       }
     }
-  }
 #endif
 
   return output;
 }
 
-TORCH_LIBRARY(teal, m) {
-  m.def("sve_sparse_gemv(Tensor activation, Tensor weight, int nz_row, Tensor nz_col_index) -> Tensor");
-  m.def("sve_sparse_gemm(Tensor activation, Tensor weight, Tensor row_offsets, Tensor nz_col_indices) -> Tensor");
+TORCH_LIBRARY(sparse_op, m) {
+  m.def("sparse_gemv_icsr_sve_gather(Tensor activation, Tensor weight, int nz_row, Tensor nz_col_index) -> Tensor");
+  m.def("sparse_gemm_icsr_sve_gather(Tensor activation, Tensor weight, Tensor row_offsets, Tensor nz_col_indices) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(teal, CPU, m) {
-  m.impl("sve_sparse_gemv", sve_sparse_gemv);
-  m.impl("sve_sparse_gemm", sve_sparse_gemm);
+TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
+  m.impl("sparse_gemv_icsr_sve_gather", sparse_gemv_icsr_sve_gather);
+  m.impl("sparse_gemm_icsr_sve_gather", sparse_gemm_icsr_sve_gather);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

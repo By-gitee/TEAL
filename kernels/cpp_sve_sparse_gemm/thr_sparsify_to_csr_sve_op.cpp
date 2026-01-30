@@ -1,4 +1,4 @@
-// dense_to_csr_sve2_op.cpp
+// thr_sparsify_to_csr_sve_op.cpp
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -15,7 +15,7 @@
 
 using torch::Tensor;
 
-static inline void check_inputs_dense_to_csr(const Tensor& activation) {
+static inline void check_thr_sparsify_to_csr_sve_inputs(const Tensor& activation) {
   TORCH_CHECK(activation.device().is_cpu(), "activation must be a CPU tensor");
   TORCH_CHECK(activation.dtype() == torch::kFloat32, "activation must be float32");
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
@@ -23,8 +23,8 @@ static inline void check_inputs_dense_to_csr(const Tensor& activation) {
 }
 
 // Return: [row_offsets(int64), col_idx(uint32), values(float32)]
-static std::vector<Tensor> dense_to_csr_sve2(const Tensor& activation, double threshold) {
-  check_inputs_dense_to_csr(activation);
+static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_csr_sve(const Tensor& activation, double threshold) {
+  check_thr_sparsify_to_csr_sve_inputs(activation);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
@@ -161,7 +161,7 @@ static std::vector<Tensor> dense_to_csr_sve2(const Tensor& activation, double th
 
 #ifndef NDEBUG
       TORCH_CHECK(write_pos == nnz,
-                  "dense_to_csr_sve2: write_pos != nnz at row ", m,
+                  "thr_sparsify_to_csr_sve: write_pos != nnz at row ", m,
                   " write_pos=", write_pos, " nnz=", nnz);
 #endif
 
@@ -182,7 +182,13 @@ static std::vector<Tensor> dense_to_csr_sve2(const Tensor& activation, double th
   return {row_offsets, col_idx, values};
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("dense_to_csr_sve2", &dense_to_csr_sve2,
-        "Dense activation to CSR (row_offsets, col_idx, values) using SVE2 compact (CPU)");
+// 注册到 PyTorch
+// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
+// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
+  m.def("thr_sparsify_to_csr_sve(Tensor activation, float threshold) -> (Tensor row_offsets, Tensor nz_col_indices, Tensor values)");
+}
+
+TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
+  m.impl("thr_sparsify_to_csr_sve", thr_sparsify_to_csr_sve);
 }

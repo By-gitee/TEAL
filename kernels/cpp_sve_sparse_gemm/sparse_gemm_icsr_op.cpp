@@ -31,7 +31,7 @@
 
 namespace {
 
-void check_inputs_direct_gemm(
+void check_inputs_icsr_gemm(
     const torch::Tensor& activation,
     const torch::Tensor& weight,
     const torch::Tensor& row_offsets,
@@ -66,21 +66,30 @@ void check_inputs_direct_gemm(
   TORCH_CHECK(row_offsets.data_ptr<int64_t>()[M] == nz_col_indices.numel(), 
               "row_offsets[M] must equal nz_col_indices size");
 }
+} // namespace
 
+torch::Tensor sparse_gemm_icsr(
+    torch::Tensor activation,
+    torch::Tensor weight,
+    torch::Tensor row_offsets,
+    torch::Tensor nz_col_indices) {
+  check_inputs_icsr_gemm(activation, weight, row_offsets, nz_col_indices);
 
-// 直接使用输入信息进行 GEMM 计算（不构建 CSR）
-void direct_gemm_compute(
-    const float* act_ptr,
-    const uint32_t* nz_col_indices_ptr,
-    const float* weight_ptr, // (K, N)
-    float* out_ptr,          // (M, N)
-    int64_t M,
-    int64_t K,
-    int64_t N,
-    const int64_t* row_offsets) {
-  
-  // 选一个 N 分块大小：建议是 L1-friendly 且是 16 的倍数（方便向量化）
-  // 经验：256/384/512 都常用。你可以按平台调参。
+  const int64_t M = activation.size(0);
+  const int64_t K = activation.size(1);
+  const int64_t N = weight.size(1);
+
+  auto output = torch::zeros({M, N}, activation.options());
+  if (M == 0 || K == 0 || N == 0) {
+    return output;
+  }
+
+  const float* act_ptr = activation.data_ptr<float>();
+  const float* weight_ptr = weight.data_ptr<float>();
+  const int64_t* row_offsets_ptr = row_offsets.data_ptr<int64_t>();
+  const uint32_t* indices_ptr = nz_col_indices.data_ptr<uint32_t>();
+  float* out_ptr = output.data_ptr<float>();
+
   constexpr int64_t BN = 512;
   
   const int64_t NB = (N + BN - 1) / BN;
@@ -89,8 +98,8 @@ void direct_gemm_compute(
   #pragma omp parallel for collapse(2) schedule(static)
   for (int64_t m = 0; m < M; ++m) {
     for (int64_t nb = 0; nb < NB; ++nb) {
-      const int64_t p0 = row_offsets[m];
-      const int64_t p1 = row_offsets[m + 1];
+      const int64_t p0 = row_offsets_ptr[m];
+      const int64_t p1 = row_offsets_ptr[m + 1];
       if (p0 == p1) continue; // 该行没有非零元素
       
       const int64_t n0 = nb * BN;
@@ -105,7 +114,7 @@ void direct_gemm_compute(
       #if defined(__ARM_FEATURE_SVE)
         // SVE 路径：对 [n0, n1) 做向量累加，尾部用谓词处理
         for (int64_t j = 0; j < count; ++j) {
-          const uint32_t k = nz_col_indices_ptr[p0 + j];
+          const uint32_t k = indices_ptr[p0 + j];
           const float a = act_row_ptr[(int64_t)k]; // 直接从 activation 取值
           const float* w_row = weight_ptr + (int64_t)k * N;
           
@@ -126,7 +135,7 @@ void direct_gemm_compute(
       #else
         // 标量路径：只更新该 N tile
         for (int64_t j = 0; j < count; ++j) {
-          const uint32_t k = nz_col_indices_ptr[p0 + j];
+          const uint32_t k = indices_ptr[p0 + j];
           const float a = act_row_ptr[(int64_t)k]; // 直接从 activation 取值
           const float* w_row = weight_ptr + (int64_t)k * N;
           for (int64_t n = n0; n < n1; ++n) {
@@ -136,44 +145,14 @@ void direct_gemm_compute(
       #endif
     }
   }
-}
-
-} // namespace
-
-torch::Tensor sve_sparse_act_direct_gemm(
-    torch::Tensor activation,
-    torch::Tensor weight,
-    torch::Tensor row_offsets,
-    torch::Tensor nz_col_indices) {
-  check_inputs_direct_gemm(activation, weight, row_offsets, nz_col_indices);
-
-  const int64_t M = activation.size(0);
-  const int64_t K = activation.size(1);
-  const int64_t N = weight.size(1);
-
-  auto output = torch::zeros({M, N}, activation.options());
-  if (M == 0 || K == 0 || N == 0) {
-    return output;
-  }
-
-  const float* act_ptr = activation.data_ptr<float>();
-  const float* weight_ptr = weight.data_ptr<float>();
-  const int64_t* row_offsets_ptr = row_offsets.data_ptr<int64_t>();
-  const uint32_t* indices_ptr = nz_col_indices.data_ptr<uint32_t>();
-  float* out_ptr = output.data_ptr<float>();
-
-  // 直接使用 row_offsets 进行 GEMM 计算（不构建 CSR）
-  direct_gemm_compute(
-      act_ptr, indices_ptr, weight_ptr, out_ptr,
-      M, K, N, row_offsets_ptr);
   return output;
 }
 
-// 注册到 torch.ops.teal
-TORCH_LIBRARY_FRAGMENT(teal, m) {
-  m.def("sve_sparse_act_direct_gemm(Tensor activation, Tensor weight, Tensor row_offsets, Tensor nz_col_indices) -> Tensor");
+// 注册到 torch.ops.sparse_op
+TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
+  m.def("sparse_gemm_icsr(Tensor activation, Tensor weight, Tensor row_offsets, Tensor nz_col_indices) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(teal, CPU, m) {
-  m.impl("sve_sparse_act_direct_gemm", sve_sparse_act_direct_gemm);
+TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
+  m.impl("sparse_gemm_icsr", sparse_gemm_icsr);
 }

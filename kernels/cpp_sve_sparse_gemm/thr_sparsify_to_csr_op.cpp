@@ -1,4 +1,3 @@
-// dense_to_csr_omp_op.cpp  (common optimizations, no SVE/SVE2 specifics)
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -13,7 +12,7 @@
 
 using torch::Tensor;
 
-static inline void check_inputs_dense_to_csr(const Tensor& activation) {
+static inline void check_thr_sparsify_to_csr_inputs(const Tensor& activation) {
   TORCH_CHECK(activation.device().is_cpu(), "activation must be a CPU tensor");
   TORCH_CHECK(activation.dtype() == torch::kFloat32, "activation must be float32");
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
@@ -28,9 +27,10 @@ static inline float abs_f32_fast(float x) {
   return v.f;
 }
 
-// Return: [row_offsets(int64), col_idx(uint32), values(float32)]
-static std::vector<Tensor> dense_to_csr_omp(const Tensor& activation, double threshold) {
-  check_inputs_dense_to_csr(activation);
+// thr_sparsify_to_csr(activation, threshold) -> (row_offsets, nz_col_indices, values)
+static std::tuple<Tensor, Tensor, Tensor>
+thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
+  check_thr_sparsify_to_csr_inputs(activation);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
@@ -71,14 +71,14 @@ static std::vector<Tensor> dense_to_csr_omp(const Tensor& activation, double thr
   }
   const int64_t total_nnz = offsets[M];
 
-  // ---------------- Allocate CSR arrays: col_idx + values ----------------
-  Tensor col_idx = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
-  uint32_t* out_idx = (total_nnz > 0) ? col_idx.data_ptr<uint32_t>() : nullptr;
+  // ---------------- Allocate CSR arrays: nz_col_indices + values ----------------
+  Tensor nz_col_indices = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+  uint32_t* out_idx = (total_nnz > 0) ? nz_col_indices.data_ptr<uint32_t>() : nullptr;
 
   Tensor values = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
   float* out_val = (total_nnz > 0) ? values.data_ptr<float>() : nullptr;
 
-  // ---------------- Pass2: write col_idx + values ----------------
+  // ---------------- Pass2: write nz_col_indices + values ----------------
   // Optimization: per-row small buffer, batch stores to reduce store traffic and branch pressure.
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -100,7 +100,7 @@ static std::vector<Tensor> dense_to_csr_omp(const Tensor& activation, double thr
         dst_val[k] = row[k];
       }
 #ifndef NDEBUG
-      TORCH_CHECK(write_pos + K == nnz, "dense_to_csr_omp: nnz==K fastpath mismatch");
+      TORCH_CHECK(write_pos + K == nnz, "thr_sparsify_to_csr: nnz==K fastpath mismatch");
 #endif
       continue;
     }
@@ -165,15 +165,21 @@ static std::vector<Tensor> dense_to_csr_omp(const Tensor& activation, double thr
 
 #ifndef NDEBUG
     TORCH_CHECK(write_pos == nnz,
-                "dense_to_csr_omp: write_pos != nnz at row ", m,
+                "thr_sparsify_to_csr: write_pos != nnz at row ", m,
                 " write_pos=", write_pos, " nnz=", nnz);
 #endif
   }
 
-  return {row_offsets, col_idx, values};
+  return {row_offsets, nz_col_indices, values};
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("dense_to_csr_omp", &dense_to_csr_omp,
-        "Dense activation to CSR (row_offsets, col_idx, values) using OpenMP + common optimizations (CPU, no SVE2)");
+// 注册到 PyTorch
+// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
+// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
+  m.def("thr_sparsify_to_csr(Tensor activation, float threshold) -> (Tensor row_offsets, Tensor nz_col_indices, Tensor values)");
+}
+
+TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
+  m.impl("thr_sparsify_to_csr", thr_sparsify_to_csr);
 }

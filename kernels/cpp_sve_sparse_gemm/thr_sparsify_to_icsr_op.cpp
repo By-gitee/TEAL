@@ -10,17 +10,17 @@
 #include <omp.h>
 
 // --------- Input checks ----------
-static inline void check_row_scan_inputs(const torch::Tensor& activation) {
+static inline void check_thr_sparsify_to_icsr_inputs(const torch::Tensor& activation) {
   TORCH_CHECK(activation.device().is_cpu(), "activation must be a CPU tensor");
   TORCH_CHECK(activation.dtype() == torch::kFloat32, "activation must be float32");
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D [M, K]");
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
 }
 
-// --------- Core: row_scan_naive(activation, threshold) -> (nz_counts, nz_col_indices, row_offsets) ----------
+// --------- Core: thr_sparsify_to_icsr(activation, threshold) -> (nz_counts, nz_col_indices, row_offsets) ----------
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-row_scan_naive(torch::Tensor activation, double threshold) {
-  check_row_scan_inputs(activation);
+thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
+  check_thr_sparsify_to_icsr_inputs(activation);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
@@ -108,7 +108,13 @@ row_scan_naive(torch::Tensor activation, double threshold) {
   return {nz_counts_t, nz_col_indices_t, row_offsets_t};
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("row_scan_naive", &row_scan_naive,
-        "RowScan-Naive: activation + threshold -> nz_counts + nz_col_indices + row_offsets (CPU, parallel, no SVE)");
+// 注册到 PyTorch
+// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
+// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
+  m.def("thr_sparsify_to_icsr(Tensor activation, float threshold) -> (Tensor nz_counts, Tensor nz_col_indices, Tensor row_offsets)");
+}
+
+TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
+  m.impl("thr_sparsify_to_icsr", thr_sparsify_to_icsr);
 }

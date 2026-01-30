@@ -21,17 +21,17 @@ static inline void check_inputs(const Tensor& activation) {
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D [M, K]");
 }
 
-std::vector<Tensor> row_scan_sve(const Tensor& activation, double threshold) {
+std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor& activation, double threshold) {
   check_inputs(activation);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
-  const float *act_ptr = activation.data_ptr<float>();
+  const float* act_ptr = activation.data_ptr<float>();
   const float thr = static_cast<float>(threshold);
 
   // 分配每行非零元素计数数组（int64，便于后续前缀和计算）
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t *counts = counts_t.data_ptr<int64_t>();
+  int64_t* counts = counts_t.data_ptr<int64_t>();
 
   // Pass1：统计每行满足阈值的元素个数
 #ifdef _OPENMP
@@ -39,15 +39,15 @@ std::vector<Tensor> row_scan_sve(const Tensor& activation, double threshold) {
 #endif
   {
 #if defined(__ARM_FEATURE_SVE)
-    const svfloat32_t vthr = svdup_f32(thr);      // 将阈值广播至向量
-    const size_t vl = svcntw();                   // 每个向量可处理的float数量（动态VL）
+    const svfloat32_t vthr = svdup_f32(thr);  // 将阈值广播至向量
+    const size_t vl = svcntw();               // 每个向量可处理的float数量（动态VL）
 #endif
 
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
     for (int64_t m = 0; m < M; ++m) {
-      const float *row = act_ptr + m * K;
+      const float* row = act_ptr + m * K;
       int64_t nnz = 0;
 #if defined(__ARM_FEATURE_SVE)
       int64_t k = 0;
@@ -91,7 +91,7 @@ std::vector<Tensor> row_scan_sve(const Tensor& activation, double threshold) {
 
   // 计算行前缀和（row_offsets，长度M+1）
   Tensor row_offsets = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t *offsets = row_offsets.data_ptr<int64_t>();
+  int64_t* offsets = row_offsets.data_ptr<int64_t>();
   offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
     offsets[m + 1] = offsets[m] + counts[m];
@@ -100,7 +100,7 @@ std::vector<Tensor> row_scan_sve(const Tensor& activation, double threshold) {
 
   // 分配输出的列索引数组（uint32，一维压平）
   Tensor nz_col_indices = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
-  uint32_t *out_idx = (total_nnz > 0 ? nz_col_indices.data_ptr<uint32_t>() : nullptr);
+  uint32_t* out_idx = (total_nnz > 0 ? nz_col_indices.data_ptr<uint32_t>() : nullptr);
 
   // Pass2：按照前缀和将各行非零列索引压缩写入输出数组
 #ifdef _OPENMP
@@ -119,8 +119,8 @@ std::vector<Tensor> row_scan_sve(const Tensor& activation, double threshold) {
       const int64_t nnz = counts[m];
       if (nnz == 0) continue;  // 无非零元素则跳过
 
-      const float *row = act_ptr + m * K;
-      uint32_t *dst = out_idx + offsets[m];
+      const float* row = act_ptr + m * K;
+      uint32_t* dst = out_idx + offsets[m];
       int64_t write_pos = 0;
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE2)
       if (nnz == K) {
@@ -211,7 +211,7 @@ std::vector<Tensor> row_scan_sve(const Tensor& activation, double threshold) {
     if (counts[m] > 0) num_nz_rows++;
   }
   Tensor nz_counts = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t *nzp = nz_counts.data_ptr<int64_t>();
+  int64_t* nzp = nz_counts.data_ptr<int64_t>();
   int64_t p = 0;
   for (int64_t m = 0; m < M; ++m) {
     int64_t nnz = counts[m];
@@ -221,9 +221,17 @@ std::vector<Tensor> row_scan_sve(const Tensor& activation, double threshold) {
     }
   }
 
-  return {nz_counts, nz_col_indices, row_offsets};
+  return std::make_tuple(nz_counts, nz_col_indices, row_offsets);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("row_scan_sve", &row_scan_sve, "RowScan-SVE2 optimized (index generation with SVE2)");
+// 注册到 PyTorch
+// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
+// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
+  m.def("thr_sparsify_to_icsr_sve(Tensor activation, float threshold) -> (Tensor, Tensor, Tensor)");
 }
+
+TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
+  m.impl("thr_sparsify_to_icsr_sve", thr_sparsify_to_icsr_sve);
+}
+

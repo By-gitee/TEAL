@@ -1,5 +1,36 @@
+import time
+from typing import Callable
+
 import torch
 from scipy.stats import gmean
+
+def measure_latency(
+    fn: Callable[[], torch.Tensor],
+    warmup: int = 20,
+    iters: int = 100,
+) -> float:
+    """
+    简单的端到端延迟测量（毫秒）。
+    - CPU: 使用 time.perf_counter
+    - GPU: 在关键点同步以避免异步干扰
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    for _ in range(warmup):
+        fn()
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    return (t1 - t0) * 1000.0 / iters
 
 def benchmark(fn, warmup=100, rep=200, quantiles=None, fast_flush=True):
     # https://github.com/nox-410/tvm.tl/blob/tl/python/tvm/tl/utils.py#L144    
