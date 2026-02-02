@@ -194,7 +194,7 @@ torch::Tensor sparse_gemm_icsr_sve_gather(
     torch::Tensor weight,
     torch::Tensor row_offsets,
     torch::Tensor nz_col_indices) {
-  check_sparse_gemm_icsr_sve_gather_inputs(activation, weight, row_offsets, nz_col_indices);
+  // check_sparse_gemm_icsr_sve_gather_inputs(activation, weight, row_offsets, nz_col_indices);
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);

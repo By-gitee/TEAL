@@ -99,7 +99,7 @@ torch::Tensor sparse_gemm_csr(
   // 直接使用输入的CSR数据指针，不需要构建CSR结构
   // 选一个 N 分块大小：建议是 L1-friendly 且是 16 的倍数（方便向量化）
   // 经验：256/384/512 都常用。你可以按平台调参。
-  constexpr int64_t BN = 512;
+  const int64_t BN = N/16;
 
   const int64_t NB = (N + BN - 1) / BN;
 

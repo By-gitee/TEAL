@@ -107,7 +107,7 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
 
     // Small staging buffers (stack). Tune BUFSZ to trade branch vs memcpy overhead.
     // 64 is a good default for K up to ~1e4 and M small.
-    constexpr int BUFSZ = 64;
+    const int BUFSZ = 64;
     uint32_t idx_buf[BUFSZ];
     float val_buf[BUFSZ];
     int buf_n = 0;
@@ -164,7 +164,7 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
     }
 
 #ifndef NDEBUG
-    TORCH_CHECK(write_pos == nnz,
+    TORCH_CHECK (write_pos == nnz,
                 "thr_sparsify_to_csr: write_pos != nnz at row ", m,
                 " write_pos=", write_pos, " nnz=", nnz);
 #endif

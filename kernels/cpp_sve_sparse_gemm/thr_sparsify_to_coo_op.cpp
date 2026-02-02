@@ -130,7 +130,7 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
 
     // Small staging buffers (stack). Tune BUFSZ to trade branch vs memcpy overhead.
     // 64 is a good default for K up to ~1e4 and M small.
-    constexpr int BUFSZ = 64;
+    const int BUFSZ = 64;
     int64_t row_buf[BUFSZ];
     uint32_t col_buf[BUFSZ];
     float val_buf[BUFSZ];

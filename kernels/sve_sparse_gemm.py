@@ -33,14 +33,15 @@ from __future__ import annotations
 
 import os
 import platform
-import time
 from pathlib import Path
-from typing import Callable, Optional
+from types import ModuleType
+from typing import Optional
 
 import torch
 from torch.utils.cpp_extension import load
 
 from kernels.compile_wrapper import BaseKernel
+from kernels.kernel_utils import measure_latency as measure_latency
 
 
 ROOT = Path(__file__).resolve().parent
@@ -71,7 +72,7 @@ def _extra_ldflags() -> list[str]:
 def load_sve_sparse_gemm_extension(
     rebuild: bool = False,
     verbose: bool = False,
-) -> Optional[torch.types.ModuleType]:
+) -> Optional[ModuleType]:
     """
     编译并加载 C++ 扩展。若算子已注册则跳过重复构建。
     """
@@ -315,7 +316,7 @@ class SparseGEMMCSCKernel(BaseKernel):
     Args:
         weight: (K, N) 稠密权重矩阵
         col_ptr: 1D int64, length = K + 1, CSC格式的列指针（前缀和）
-        row_indices: 1D uint32/int32, CSC格式的行索引
+        row_indices: 1D uint32, CSC格式的行索引（C++ 侧强制 uint32）
         values: 1D float32, CSC格式的非零元素值
         M: 输出矩阵的行数
         ncore: 并行线程数，默认为 0（自动使用 OpenMP 默认线程数）
@@ -358,11 +359,16 @@ class SparseGEMMCOOKernel(BaseKernel):
     该算子直接使用输入的 COO 格式数据进行矩阵乘法。
     计算逻辑：对于每个非零元素 (i, j, val): output[i, :] += val * weight[j, :]
     
+    重要：该算子对应的 C++ 签名为：
+      sparse_gemm_coo(Tensor weight, Tensor row_indices, Tensor col_indices, Tensor values, int M, int K, int N) -> Tensor
+    因此 Python wrapper **必须**额外传入 M（稀疏矩阵行数）。K/N 从 weight 推导并传入 C++。
+
     Args:
         weight: (K, N) 稠密权重矩阵（float32, contiguous, CPU）
         row_indices: 1D int64, length = nnz, COO格式的行索引（已按行排序）
-        col_indices: 1D int64, length = nnz, COO格式的列索引（与row_indices对应）
+        col_indices: 1D int64/uint32 等整型均可；C++ 侧要求 int64，本 wrapper 会转换为 int64 contiguous
         values: 1D float32, length = nnz, COO格式的非零元素值（与row_indices对应）
+        M: 稀疏矩阵的行数（通常等于生成这些 COO 数据的 activation.size(0)）
     
     Returns:
         output: (M, N) 输出矩阵
@@ -374,12 +380,8 @@ class SparseGEMMCOOKernel(BaseKernel):
         row_indices: torch.Tensor,
         col_indices: torch.Tensor,
         values: torch.Tensor,
+        M: int,
     ) -> torch.Tensor:
-        # 推断稀疏矩阵的行数 M
-        if row_indices.size(0) > 0:
-            M = int(row_indices.max().item()) + 1
-        else:
-            M = 0
         N = weight.size(1)
         return weight.new_empty((M, N), device="meta")
 
@@ -389,10 +391,18 @@ class SparseGEMMCOOKernel(BaseKernel):
         row_indices: torch.Tensor,
         col_indices: torch.Tensor,
         values: torch.Tensor,
+        M: int,
     ) -> torch.Tensor:
         load_sve_sparse_gemm_extension()
+        K = int(weight.size(0))
+        N = int(weight.size(1))
+        # C++ 侧要求 col_indices=int64；thr_sparsify_to_coo 返回的是 uint32，这里统一转换
+        if col_indices.dtype != torch.int64:
+            col_indices = col_indices.to(torch.int64)
+        if not col_indices.is_contiguous():
+            col_indices = col_indices.contiguous()
         return torch.ops.sparse_op.sparse_gemm_coo(
-            weight, row_indices, col_indices, values
+            weight, row_indices, col_indices, values, int(M), K, N
         )
 
 
@@ -407,11 +417,16 @@ class SparseGEMMCOOSVEGatherKernel(BaseKernel):
     - 使用 gather load 从 weight 加载数据
     - N 维度分块提高缓存局部性
     
+    重要：该算子对应的 C++ 签名为：
+      sparse_gemm_coo_sve_gather(Tensor weight, Tensor row_indices, Tensor col_indices, Tensor values, int64 M, int64 K, int64 N) -> Tensor
+    因此 Python wrapper **必须**额外传入 M（稀疏矩阵行数）。K/N 从 weight 推导并传入 C++。
+
     Args:
         weight: (K, N) 稠密权重矩阵（float32, contiguous, CPU）
         row_indices: 1D int64, length = nnz, COO格式的行索引（已按行排序）
         col_indices: 1D uint32, length = nnz, COO格式的列索引（与row_indices对应）
         values: 1D float32, length = nnz, COO格式的非零元素值（与row_indices对应）
+        M: 稀疏矩阵的行数（通常等于生成这些 COO 数据的 activation.size(0)）
     
     Returns:
         output: (M, N) 输出矩阵
@@ -423,12 +438,8 @@ class SparseGEMMCOOSVEGatherKernel(BaseKernel):
         row_indices: torch.Tensor,
         col_indices: torch.Tensor,
         values: torch.Tensor,
+        M: int,
     ) -> torch.Tensor:
-        # 推断稀疏矩阵的行数 M
-        if row_indices.size(0) > 0:
-            M = int(row_indices.max().item()) + 1
-        else:
-            M = 0
         N = weight.size(1)
         return weight.new_empty((M, N), device="meta")
 
@@ -438,10 +449,13 @@ class SparseGEMMCOOSVEGatherKernel(BaseKernel):
         row_indices: torch.Tensor,
         col_indices: torch.Tensor,
         values: torch.Tensor,
+        M: int,
     ) -> torch.Tensor:
         load_sve_sparse_gemm_extension()
+        K = int(weight.size(0))
+        N = int(weight.size(1))
         return torch.ops.sparse_op.sparse_gemm_coo_sve_gather(
-            weight, row_indices, col_indices, values
+            weight, row_indices, col_indices, values, int(M), K, N
         )
 
 
@@ -577,3 +591,39 @@ def thr_sparsify_to_csc(activation: torch.Tensor, threshold: float, verbose: boo
     """
     load_sve_sparse_gemm_extension(verbose=verbose)
     return torch.ops.sparse_op.thr_sparsify_to_csc(activation, float(threshold))
+
+
+# -----------------------------------------------------------------------------
+# 兼容层：保持旧导入路径/符号名可用
+# -----------------------------------------------------------------------------
+# kernels/__init__.py 历史上导出过 SVESparseGEMVKernel / SVESparseGEMMKernel。
+# 这里将其映射到当前实现中最常用的 iCSR SVE gather 版本。
+SVESparseGEMVKernel = SparseGEMViCSRSVEGatherKernel
+SVESparseGEMMKernel = SparseGEMMiCSRSVEGatherKernel
+
+__all__ = [
+    # extension loader
+    "load_sve_sparse_gemm_extension",
+    # latency helper (re-export)
+    "measure_latency",
+    # legacy aliases
+    "SVESparseGEMVKernel",
+    "SVESparseGEMMKernel",
+    # kernels
+    "SparseGEMViCSRSVEGatherKernel",
+    "SparseGEMMiCSRSVEGatherKernel",
+    "SparseGEMMCSRKernel",
+    "SparseGEMMCSRSVEGatherKernel",
+    "SparseGEMMICSRKernel",
+    "SparseGEMMCSCKernel",
+    "SparseGEMMCOOKernel",
+    "SparseGEMMCOOSVEGatherKernel",
+    # sparsifiers
+    "thr_sparsify_to_icsr",
+    "thr_sparsify_to_icsr_sve",
+    "thr_sparsify_to_csr",
+    "thr_sparsify_to_csr_sve",
+    "thr_sparsify_to_coo",
+    "thr_sparsify_to_coo_sve",
+    "thr_sparsify_to_csc",
+]

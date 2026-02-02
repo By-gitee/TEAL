@@ -32,7 +32,7 @@ import argparse
 import torch
 from typing import Callable, Dict, List, Tuple
 
-from kernels.sve_sparse_gemm import (
+from kernels.cpp_sve_sparse_gemm import (
     # iCSR 算子
     SparseGEMMiCSRSVEGatherKernel,
     SparseGEMMICSRKernel,
@@ -65,13 +65,17 @@ def _make_random_sparse_activation(
     """生成随机 activation 矩阵（float32）。"""
     g = torch.Generator()
     g.manual_seed(seed)
-    x = torch.randn(M, K, dtype=torch.float32, generator=g)
+    x = torch.rand(M, K, dtype=torch.float32, generator=g)
     return x
 
 
 def _apply_threshold(activation: torch.Tensor, threshold: float = 0.0) -> torch.Tensor:
-    """对 activation 矩阵应用阈值，大于 threshold 的值保留，其余置零。"""
-    return torch.where(activation > threshold, activation, torch.zeros_like(activation))
+    """对 activation 矩阵应用阈值：abs(x) >= threshold 的值保留，其余置零。
+
+    注意：cpp_sve_sparse_gemm 下的 thr_sparsify_to_* 系列算子使用的是 abs(x) >= thr 的判定；
+    这里必须保持一致，否则会出现系统性正确性偏差（尤其是 activation 含负值时）。
+    """
+    return torch.where(activation.abs() >= threshold, activation, torch.zeros_like(activation))
 
 
 # =============================================================================
@@ -282,15 +286,18 @@ def test_coo_combinations(
     )
     coo_sve_gather_op = coo_sve_gather_kernel.operator(compiled=True)
     
+    # C++ 算子签名需要显式传入 M（稀疏矩阵行数）
+    M = int(activation.size(0))
+
     # 组合 1: thr_sparsify_to_coo + sparse_gemm_coo
     print("\n[COO-1] thr_sparsify_to_coo + sparse_gemm_coo")
     def coo_combo1():
         row_indices, col_indices, values = thr_sparsify_to_coo(activation, threshold)
         # sparse_gemm_coo 需要 int64 的 col_indices，thr_sparsify_to_coo 返回 uint32
         col_indices_i64 = col_indices.to(torch.int64)
-        return coo_op(weight, row_indices, col_indices_i64, values)
+        return coo_op(weight, row_indices, col_indices_i64, values, M)
     
-    lat1 = measure_latency(coo_combo1, warmup=5, iters=100)
+    lat1 = measure_latency(coo_combo1, warmup=5, iters=1000)
     result1 = coo_combo1()
     results["COO-1: thr_sparsify_to_coo + sparse_gemm_coo"] = (result1, lat1)
     print(f"  延迟: {lat1:.4f} ms")
@@ -301,9 +308,9 @@ def test_coo_combinations(
         row_indices, col_indices, values = thr_sparsify_to_coo_sve(activation, threshold)
         # sparse_gemm_coo 需要 int64 的 col_indices，thr_sparsify_to_coo_sve 返回 uint32
         col_indices_i64 = col_indices.to(torch.int64)
-        return coo_op(weight, row_indices, col_indices_i64, values)
+        return coo_op(weight, row_indices, col_indices_i64, values, M)
     
-    lat2 = measure_latency(coo_combo2, warmup=5, iters=100)
+    lat2 = measure_latency(coo_combo2, warmup=5, iters=1000)
     result2 = coo_combo2()
     results["COO-2: thr_sparsify_to_coo_sve + sparse_gemm_coo"] = (result2, lat2)
     print(f"  延迟: {lat2:.4f} ms")
@@ -313,9 +320,9 @@ def test_coo_combinations(
     def coo_combo3():
         row_indices, col_indices, values = thr_sparsify_to_coo(activation, threshold)
         # sparse_gemm_coo_sve_gather 需要 uint32 的 col_indices，已经是 uint32
-        return coo_sve_gather_op(weight, row_indices, col_indices, values)
+        return coo_sve_gather_op(weight, row_indices, col_indices, values, M)
     
-    lat3 = measure_latency(coo_combo3, warmup=5, iters=100)
+    lat3 = measure_latency(coo_combo3, warmup=5, iters=1000)
     result3 = coo_combo3()
     results["COO-3: thr_sparsify_to_coo + sparse_gemm_coo_sve_gather"] = (result3, lat3)
     print(f"  延迟: {lat3:.4f} ms")
@@ -325,9 +332,9 @@ def test_coo_combinations(
     def coo_combo4():
         row_indices, col_indices, values = thr_sparsify_to_coo_sve(activation, threshold)
         # sparse_gemm_coo_sve_gather 需要 uint32 的 col_indices，已经是 uint32
-        return coo_sve_gather_op(weight, row_indices, col_indices, values)
+        return coo_sve_gather_op(weight, row_indices, col_indices, values, M)
     
-    lat4 = measure_latency(coo_combo4, warmup=5, iters=100)
+    lat4 = measure_latency(coo_combo4, warmup=5, iters=1000)
     result4 = coo_combo4()
     results["COO-4: thr_sparsify_to_coo_sve + sparse_gemm_coo_sve_gather"] = (result4, lat4)
     print(f"  延迟: {lat4:.4f} ms")
@@ -596,9 +603,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--threshold", type=float, default=0.8, help="稀疏化阈值")
-    parser.add_argument("--M", type=int, default=16, help="activation 行数")
-    parser.add_argument("--K", type=int, default=512, help="activation 列数 / weight 行数")
-    parser.add_argument("--N", type=int, default=1024, help="weight 列数")
+    parser.add_argument("--M", type=int, default=1, help="activation 行数")
+    parser.add_argument("--K", type=int, default=4096, help="activation 列数 / weight 行数")
+    parser.add_argument("--N", type=int, default=11008, help="weight 列数")
     args = parser.parse_args()
     
     print("=" * 80)

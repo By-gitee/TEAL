@@ -143,7 +143,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
 
     // 小缓冲区用于批量处理同一列的多个元素
     // 虽然一行中同一列只有一个元素，但缓冲区可以减少原子操作次数
-    constexpr int BUFSZ = 64;
+    const int BUFSZ = 64;
     struct Entry {
       int64_t col;
       float val;

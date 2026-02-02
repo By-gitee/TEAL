@@ -48,7 +48,10 @@ void check_inputs_coo_sve_gather(
     const torch::Tensor& weight,
     const torch::Tensor& row_indices,
     const torch::Tensor& col_indices,
-    const torch::Tensor& values) {
+    const torch::Tensor& values,
+    int64_t M,
+    int64_t K,
+    int64_t N) {
   TORCH_CHECK(weight.device().is_cpu(), "weight must be a CPU tensor");
   TORCH_CHECK(row_indices.device().is_cpu(), "row_indices must be a CPU tensor");
   TORCH_CHECK(col_indices.device().is_cpu(), "col_indices must be a CPU tensor");
@@ -73,8 +76,11 @@ void check_inputs_coo_sve_gather(
   TORCH_CHECK(row_indices.size(0) == nnz, "row_indices length must equal values length");
   TORCH_CHECK(col_indices.size(0) == nnz, "col_indices length must equal values length");
   
-  const int64_t K = weight.size(0);
-  TORCH_CHECK(K > 0, "weight must have positive dimensions");
+  TORCH_CHECK(K > 0, "K must be positive");
+  TORCH_CHECK(N > 0, "N must be positive");
+  TORCH_CHECK(M > 0, "M must be positive");
+  TORCH_CHECK(K == weight.size(0), "K must be equal to weight.size(0)");
+  TORCH_CHECK(N == weight.size(1), "N must be equal to weight.size(1)");
 }
 
 } // namespace
@@ -83,35 +89,28 @@ torch::Tensor sparse_gemm_coo_sve_gather(
     torch::Tensor weight,
     torch::Tensor row_indices,
     torch::Tensor col_indices,
-    torch::Tensor values) {
-  check_inputs_coo_sve_gather(weight, row_indices, col_indices, values);
+    torch::Tensor values,
+    int64_t M,
+    int64_t K,
+    int64_t N) {
+  check_inputs_coo_sve_gather(weight, row_indices, col_indices, values, M, K, N);
 
-  const int64_t K = weight.size(0);
-  const int64_t N = weight.size(1);
   const int64_t nnz = values.size(0);
-
-  // 推断稀疏矩阵的行数 M
-  const int64_t* row_indices_ptr = row_indices.data_ptr<int64_t>();
-  int64_t M = 0;
-  if (nnz > 0) {
-    M = *std::max_element(row_indices_ptr, row_indices_ptr + nnz) + 1;
-  }
-
   auto output = torch::zeros({M, N}, weight.options());
   if (M == 0 || K == 0 || N == 0 || nnz == 0) {
     return output;
   }
 
   const float* weight_ptr = weight.data_ptr<float>();
+  const int64_t* row_indices_ptr = row_indices.data_ptr<int64_t>();
   const uint32_t* col_indices_ptr = col_indices.data_ptr<uint32_t>();
   const float* values_ptr = values.data_ptr<float>();
   float* out_ptr = output.data_ptr<float>();
-
   // 将 COO 格式转换为行起始位置数组（类似 CSR 的 row_ptr）
   // 由于 row_indices 已按行排序，可以高效地构建行起始位置
   std::vector<int64_t> row_offsets(M + 1, 0);
   for (int64_t i = 0; i < nnz; ++i) {
-    int64_t row = row_indices_ptr[i];
+    const int64_t row = row_indices_ptr[i];
     row_offsets[row + 1]++;
   }
   // 累加前缀和，得到每行的起始位置
@@ -125,7 +124,7 @@ torch::Tensor sparse_gemm_coo_sve_gather(
   const uint32_t N_u32 = (uint32_t)N;
 
   // N 维度分块，参考 CSR SVE gather 的策略
-  int64_t n_block_sz = 16;
+  int64_t n_block_sz = N/16;
   const int64_t n_full = (N / n_block_sz) * n_block_sz;
   const int64_t rem = N - n_full;
 
@@ -235,7 +234,8 @@ torch::Tensor sparse_gemm_coo_sve_gather(
 
 // 注册到 torch.ops.sparse_op
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
-  m.def("sparse_gemm_coo_sve_gather(Tensor weight, Tensor row_indices, Tensor col_indices, Tensor values) -> Tensor");
+  // schema string: use `int` (maps to int64_t) or `SymInt`, not `int64_t`
+  m.def("sparse_gemm_coo_sve_gather(Tensor weight, Tensor row_indices, Tensor col_indices, Tensor values, int M, int K, int N) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {

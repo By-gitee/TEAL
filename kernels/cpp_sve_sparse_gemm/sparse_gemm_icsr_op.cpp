@@ -90,7 +90,7 @@ torch::Tensor sparse_gemm_icsr(
   const uint32_t* indices_ptr = nz_col_indices.data_ptr<uint32_t>();
   float* out_ptr = output.data_ptr<float>();
 
-  constexpr int64_t BN = 512;
+  const int64_t BN = N/16;
   
   const int64_t NB = (N + BN - 1) / BN;
   
