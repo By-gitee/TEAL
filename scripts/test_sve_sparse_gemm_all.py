@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import argparse
 import torch
-from typing import Callable, Dict, List, Tuple
+import time
+from typing import Any, Dict, List, Tuple
 
 from kernels.cpp_sve_sparse_gemm import (
     # iCSR 算子
@@ -56,6 +57,11 @@ from kernels.cpp_sve_sparse_gemm import (
 )
 from kernels.kernel_utils import measure_latency
 
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None  # type: ignore
+
 
 def _make_random_sparse_activation(
     M: int,
@@ -76,6 +82,401 @@ def _apply_threshold(activation: torch.Tensor, threshold: float = 0.0) -> torch.
     这里必须保持一致，否则会出现系统性正确性偏差（尤其是 activation 含负值时）。
     """
     return torch.where(activation.abs() >= threshold, activation, torch.zeros_like(activation))
+
+
+def _print_ranked_latencies(
+    title: str,
+    latencies: List[Tuple[str, float]],
+    baseline_latency: float | None = None,
+) -> None:
+    """按延迟从快到慢打印排名，可选打印相对 baseline 的加速比。"""
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+    if not latencies:
+        print("（无数据）")
+        return
+
+    latencies = sorted(latencies, key=lambda x: x[1])
+    if baseline_latency is not None and baseline_latency > 0:
+        print(f"{'排名':<4} {'项目':<64} {'延迟(ms)':<12} {'加速比':<10}")
+        print("-" * 94)
+        for rank, (name, latency) in enumerate(latencies, 1):
+            speedup = baseline_latency / latency if latency > 0 else 0.0
+            print(f"{rank:2d}. {name:64s} {latency:8.4f} ms  {speedup:6.2f}x")
+    else:
+        print(f"{'排名':<4} {'项目':<72} {'延迟(ms)':<12}")
+        print("-" * 92)
+        for rank, (name, latency) in enumerate(latencies, 1):
+            print(f"{rank:2d}. {name:72s} {latency:8.4f} ms")
+
+    fastest_name, fastest_latency = latencies[0]
+    print("\n" + "-" * 80)
+    print(f"⚡ 最快: {fastest_name}")
+    print(f"   延迟: {fastest_latency:.4f} ms")
+    if baseline_latency is not None and baseline_latency > 0 and fastest_latency > 0:
+        print(f"   相比 baseline 加速比: {baseline_latency/fastest_latency:.2f}x")
+
+
+def _maybe_print_cpu_util(prefix: str, interval_s: float = 0.20) -> None:
+    """打印 CPU 利用率（系统 + 当前进程），best-effort。
+
+    依赖 psutil；若不可用则静默跳过（main 里会打印一次提示）。
+    """
+    if psutil is None:
+        return
+
+    try:
+        proc = psutil.Process()
+        # 先设置 system 基线，再用 proc 的阻塞采样得到同一时间窗的 system 利用率
+        psutil.cpu_percent(interval=None)
+        proc_cpu = proc.cpu_percent(interval=interval_s)
+        sys_cpu = psutil.cpu_percent(interval=None)
+
+        cpu_cnt = psutil.cpu_count(logical=True) or 1
+        proc_cpu_norm = proc_cpu / cpu_cnt
+
+        mem = proc.memory_info().rss / (1024 * 1024)
+        threads = proc.num_threads()
+
+        ts = time.strftime("%H:%M:%S")
+        print(
+            f"[CPU {ts}] {prefix} | sys={sys_cpu:5.1f}% | proc={proc_cpu:6.1f}% "
+            f"(norm={proc_cpu_norm:5.1f}%) | rss={mem:7.1f} MB | thr={threads}"
+        )
+    except Exception:
+        # 不让监控影响测试流程
+        return
+
+
+def _parse_selected_tests(raw_tests: List[str] | None) -> List[str]:
+    """解析 --tests 参数，支持空格/逗号分隔与常见别名。
+
+    允许项：
+    - all
+    - icsr / csr / coo / csc
+    - pytorch
+    - gemm-only
+    - preprocess-only
+    """
+    if not raw_tests:
+        raw_tests = ["all"]
+
+    tokens: List[str] = []
+    for item in raw_tests:
+        for part in item.split(","):
+            part = part.strip()
+            if part:
+                tokens.append(part)
+
+    normalized: List[str] = []
+    for t in tokens:
+        tl = t.strip().lower().replace("_", "-")
+        if tl in {"all"}:
+            normalized.append("all")
+            continue
+        if tl in {"icsr", "i-csr", "i_csr"}:
+            normalized.append("icsr")
+            continue
+        if tl in {"csr"}:
+            normalized.append("csr")
+            continue
+        if tl in {"coo"}:
+            normalized.append("coo")
+            continue
+        if tl in {"csc"}:
+            normalized.append("csc")
+            continue
+        if tl in {"pytorch", "torch"}:
+            normalized.append("pytorch")
+            continue
+        if tl in {"gemm-only", "gemmonly", "gemm", "core-gemm", "core-gemm-only"}:
+            normalized.append("gemm-only")
+            continue
+        if tl in {"preprocess-only", "preprocessonly", "preprocess", "pre"}:
+            normalized.append("preprocess-only")
+            continue
+
+        allowed = "all/icsr/csr/coo/csc/pytorch/gemm-only/preprocess-only"
+        raise ValueError(f"--tests 包含未知项: {t!r}，允许项: {allowed}")
+
+    if "all" in normalized:
+        return ["icsr", "csr", "coo", "csc", "pytorch", "gemm-only", "preprocess-only"]
+
+    # 去重并保持用户输入顺序
+    seen = set()
+    ordered_unique: List[str] = []
+    for t in normalized:
+        if t not in seen:
+            seen.add(t)
+            ordered_unique.append(t)
+    return ordered_unique
+
+
+def verify_correctness_flat(
+    results: Dict[str, Tuple[torch.Tensor, float]],
+    reference: torch.Tensor,
+) -> None:
+    """验证一组（扁平）结果的正确性（逐项与 reference 对比）。"""
+    print("\n" + "=" * 80)
+    print("正确性验证（扁平结果集）")
+    print("=" * 80)
+
+    all_passed = True
+    for name, (result, _) in results.items():
+        max_diff = torch.max(torch.abs(result - reference)).item()
+        mean_diff = torch.mean(torch.abs(result - reference)).item()
+        is_correct = torch.allclose(result, reference, rtol=1e-4, atol=1e-5)
+        status = "✅" if is_correct else "❌"
+        print(f"  {status} {name}")
+        print(f"      最大误差: {max_diff:.6e}, 平均误差: {mean_diff:.6e}")
+        if not is_correct:
+            all_passed = False
+
+    if all_passed:
+        print("\n✅ 正确性测试通过")
+    else:
+        print("\n❌ 部分结果不正确")
+
+
+def test_core_gemm_only(
+    activation: torch.Tensor,
+    activation_thresholded: torch.Tensor,
+    weight: torch.Tensor,
+    threshold: float,
+) -> Dict[str, Tuple[torch.Tensor, float]]:
+    """只测试“核心乘法（GEMM 内核）”的耗时：稀疏表示先缓存，计时循环里不包含稀疏化。"""
+    print("\n" + "=" * 80)
+    print("核心乘法（GEMM-only）对比")
+    print("=" * 80)
+
+    results: Dict[str, Tuple[torch.Tensor, float]] = {}
+
+    # Baseline: PyTorch dense matmul（不包含 threshold 的代价，thresholded 由外部预先计算）
+    print("\n[GEMM-only][PyTorch] torch.matmul(activation_thresholded, weight)")
+    def torch_dense_core():
+        return torch.matmul(activation_thresholded, weight)
+
+    lat_torch = measure_latency(torch_dense_core, warmup=5, iters=100000)
+    results["GEMM-only: PyTorch torch.matmul(thresholded, weight)"] = (torch_dense_core(), lat_torch)
+    print(f"  延迟: {lat_torch:.4f} ms")
+
+    # iCSR: 先 sparsify 一次，计时循环只跑 sparse_gemm
+    print("\n[GEMM-only][iCSR] 预先 thr_sparsify_to_icsr")
+    nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr(activation, threshold)
+
+    icsr_sve_gather_kernel = SparseGEMMiCSRSVEGatherKernel.initialize(
+        name="sparse_gemm_icsr_sve_gather", target="CPU"
+    )
+    icsr_sve_gather_op = icsr_sve_gather_kernel.operator(compiled=True)
+
+    icsr_kernel = SparseGEMMICSRKernel.initialize(
+        name="sparse_gemm_icsr", target="CPU"
+    )
+    icsr_op = icsr_kernel.operator(compiled=True)
+
+    print("  - sparse_gemm_icsr_sve_gather")
+    def icsr_gemm_gather_only():
+        return icsr_sve_gather_op(activation, weight, row_offsets, nz_col_indices)
+
+    lat = measure_latency(icsr_gemm_gather_only, warmup=5, iters=100000)
+    results["GEMM-only: iCSR sparse_gemm_icsr_sve_gather (cached indices)"] = (icsr_gemm_gather_only(), lat)
+    print(f"    延迟: {lat:.4f} ms")
+
+    print("  - sparse_gemm_icsr")
+    def icsr_gemm_only():
+        return icsr_op(activation, weight, row_offsets, nz_col_indices)
+
+    lat = measure_latency(icsr_gemm_only, warmup=5, iters=100000)
+    results["GEMM-only: iCSR sparse_gemm_icsr (cached indices)"] = (icsr_gemm_only(), lat)
+    print(f"    延迟: {lat:.4f} ms")
+
+    # CSR
+    print("\n[GEMM-only][CSR] 预先 thr_sparsify_to_csr")
+    csr_row_offsets, csr_nz_col_indices, csr_values = thr_sparsify_to_csr(activation, threshold)
+
+    csr_kernel = SparseGEMMCSRKernel.initialize(name="sparse_gemm_csr", target="CPU")
+    csr_op = csr_kernel.operator(compiled=True)
+
+    csr_sve_gather_kernel = SparseGEMMCSRSVEGatherKernel.initialize(
+        name="sparse_gemm_csr_sve_gather", target="CPU"
+    )
+    csr_sve_gather_op = csr_sve_gather_kernel.operator(compiled=True)
+
+    print("  - sparse_gemm_csr")
+    def csr_gemm_only():
+        return csr_op(weight, csr_row_offsets, csr_nz_col_indices, csr_values)
+
+    lat = measure_latency(csr_gemm_only, warmup=5, iters=100000)
+    results["GEMM-only: CSR sparse_gemm_csr (cached values)"] = (csr_gemm_only(), lat)
+    print(f"    延迟: {lat:.4f} ms")
+
+    print("  - sparse_gemm_csr_sve_gather")
+    def csr_gemm_gather_only():
+        return csr_sve_gather_op(weight, csr_row_offsets, csr_nz_col_indices, csr_values)
+
+    lat = measure_latency(csr_gemm_gather_only, warmup=5, iters=100000)
+    results["GEMM-only: CSR sparse_gemm_csr_sve_gather (cached values)"] = (csr_gemm_gather_only(), lat)
+    print(f"    延迟: {lat:.4f} ms")
+
+    # COO
+    print("\n[GEMM-only][COO] 预先 thr_sparsify_to_coo")
+    coo_row_indices, coo_col_indices, coo_values = thr_sparsify_to_coo(activation, threshold)
+    M = int(activation.size(0))
+
+    coo_kernel = SparseGEMMCOOKernel.initialize(name="sparse_gemm_coo", target="CPU")
+    coo_op = coo_kernel.operator(compiled=True)
+
+    coo_sve_gather_kernel = SparseGEMMCOOSVEGatherKernel.initialize(
+        name="sparse_gemm_coo_sve_gather", target="CPU"
+    )
+    coo_sve_gather_op = coo_sve_gather_kernel.operator(compiled=True)
+
+    # sparse_gemm_coo 需要 int64 col_indices
+    coo_col_indices_i64 = coo_col_indices.to(torch.int64)
+
+    print("  - sparse_gemm_coo")
+    def coo_gemm_only():
+        return coo_op(weight, coo_row_indices, coo_col_indices_i64, coo_values, M)
+
+    lat = measure_latency(coo_gemm_only, warmup=5, iters=100000)
+    results["GEMM-only: COO sparse_gemm_coo (cached triplets)"] = (coo_gemm_only(), lat)
+    print(f"    延迟: {lat:.4f} ms")
+
+    print("  - sparse_gemm_coo_sve_gather")
+    def coo_gemm_gather_only():
+        return coo_sve_gather_op(weight, coo_row_indices, coo_col_indices, coo_values, M)
+
+    lat = measure_latency(coo_gemm_gather_only, warmup=5, iters=100000)
+    results["GEMM-only: COO sparse_gemm_coo_sve_gather (cached triplets)"] = (coo_gemm_gather_only(), lat)
+    print(f"    延迟: {lat:.4f} ms")
+
+    # CSC
+    print("\n[GEMM-only][CSC] 预先 thr_sparsify_to_csc")
+    csc_col_ptr, csc_row_indices, csc_values = thr_sparsify_to_csc(activation, threshold)
+
+    csc_kernel = SparseGEMMCSCKernel.initialize(name="sparse_gemm_csc", target="CPU")
+    csc_op = csc_kernel.operator(compiled=True)
+
+    print("  - sparse_gemm_csc")
+    def csc_gemm_only():
+        return csc_op(weight, csc_col_ptr, csc_row_indices, csc_values, M, 0)
+
+    lat = measure_latency(csc_gemm_only, warmup=5, iters=100000)
+    results["GEMM-only: CSC sparse_gemm_csc (cached CSC)"] = (csc_gemm_only(), lat)
+    print(f"    延迟: {lat:.4f} ms")
+
+    return results
+
+
+def test_preprocess_only(
+    activation: torch.Tensor,
+    threshold: float,
+) -> Dict[str, Tuple[Any, float]]:
+    """只测试输入稀疏矩阵处理（稀疏化/格式转换）耗时：不包含任何 GEMM。"""
+    print("\n" + "=" * 80)
+    print("输入稀疏矩阵处理（Preprocess-only）对比")
+    print("=" * 80)
+
+    results: Dict[str, Tuple[Any, float]] = {}
+
+    # Baseline 1: 仅 threshold（对齐 cpp 判定 abs(x) >= thr）
+    print("\n[Preprocess-only][PyTorch] _apply_threshold")
+    def torch_threshold_only():
+        return _apply_threshold(activation, threshold=threshold)
+
+    lat = measure_latency(torch_threshold_only, warmup=5, iters=10)
+    results["Preprocess-only: PyTorch _apply_threshold(abs>=thr)"] = (torch_threshold_only(), lat)
+    print(f"  延迟: {lat:.4f} ms")
+
+    # Baseline 2: threshold + to_sparse_csr（端到端的 PyTorch CSR 构建）
+    print("\n[Preprocess-only][PyTorch] threshold + to_sparse_csr")
+    def torch_to_sparse_csr():
+        x = _apply_threshold(activation, threshold=threshold)
+        sp = x.to_sparse_csr()
+        # 访问 components，避免 lazy 路径把工作延后到后续阶段
+        _ = sp.crow_indices()
+        _ = sp.col_indices()
+        _ = sp.values()
+        return sp
+
+    lat = measure_latency(torch_to_sparse_csr, warmup=5, iters=10)
+    results["Preprocess-only: PyTorch threshold + to_sparse_csr()"] = (torch_to_sparse_csr(), lat)
+    print(f"  延迟: {lat:.4f} ms")
+
+    # Baseline 3: threshold + to_sparse_csc（端到端的 PyTorch CSC 构建）
+    print("\n[Preprocess-only][PyTorch] threshold + to_sparse_csc")
+    def torch_to_sparse_csc():
+        x = _apply_threshold(activation, threshold=threshold)
+        sp = x.to_sparse_csc()
+        _ = sp.ccol_indices()
+        _ = sp.row_indices()
+        _ = sp.values()
+        return sp
+
+    lat = measure_latency(torch_to_sparse_csc, warmup=5, iters=10)
+    results["Preprocess-only: PyTorch threshold + to_sparse_csc()"] = (torch_to_sparse_csc(), lat)
+    print(f"  延迟: {lat:.4f} ms")
+
+    # Custom: iCSR sparsify
+    print("\n[Preprocess-only][iCSR] thr_sparsify_to_icsr / thr_sparsify_to_icsr_sve")
+    def icsr_pre_1():
+        return thr_sparsify_to_icsr(activation, threshold)
+
+    lat = measure_latency(icsr_pre_1, warmup=5, iters=100000)
+    results["Preprocess-only: iCSR thr_sparsify_to_icsr"] = (icsr_pre_1(), lat)
+    print(f"  - thr_sparsify_to_icsr: {lat:.4f} ms")
+
+    def icsr_pre_2():
+        return thr_sparsify_to_icsr_sve(activation, threshold)
+
+    lat = measure_latency(icsr_pre_2, warmup=5, iters=100000)
+    results["Preprocess-only: iCSR thr_sparsify_to_icsr_sve"] = (icsr_pre_2(), lat)
+    print(f"  - thr_sparsify_to_icsr_sve: {lat:.4f} ms")
+
+    # Custom: CSR sparsify
+    print("\n[Preprocess-only][CSR] thr_sparsify_to_csr / thr_sparsify_to_csr_sve")
+    def csr_pre_1():
+        return thr_sparsify_to_csr(activation, threshold)
+
+    lat = measure_latency(csr_pre_1, warmup=5, iters=100000)
+    results["Preprocess-only: CSR thr_sparsify_to_csr"] = (csr_pre_1(), lat)
+    print(f"  - thr_sparsify_to_csr: {lat:.4f} ms")
+
+    def csr_pre_2():
+        return thr_sparsify_to_csr_sve(activation, threshold)
+
+    lat = measure_latency(csr_pre_2, warmup=5, iters=100000)
+    results["Preprocess-only: CSR thr_sparsify_to_csr_sve"] = (csr_pre_2(), lat)
+    print(f"  - thr_sparsify_to_csr_sve: {lat:.4f} ms")
+
+    # Custom: COO sparsify
+    print("\n[Preprocess-only][COO] thr_sparsify_to_coo / thr_sparsify_to_coo_sve")
+    def coo_pre_1():
+        return thr_sparsify_to_coo(activation, threshold)
+
+    lat = measure_latency(coo_pre_1, warmup=5, iters=100000)
+    results["Preprocess-only: COO thr_sparsify_to_coo"] = (coo_pre_1(), lat)
+    print(f"  - thr_sparsify_to_coo: {lat:.4f} ms")
+
+    def coo_pre_2():
+        return thr_sparsify_to_coo_sve(activation, threshold)
+
+    lat = measure_latency(coo_pre_2, warmup=5, iters=100000)
+    results["Preprocess-only: COO thr_sparsify_to_coo_sve"] = (coo_pre_2(), lat)
+    print(f"  - thr_sparsify_to_coo_sve: {lat:.4f} ms")
+
+    # Custom: CSC sparsify
+    print("\n[Preprocess-only][CSC] thr_sparsify_to_csc")
+    def csc_pre():
+        return thr_sparsify_to_csc(activation, threshold)
+
+    lat = measure_latency(csc_pre, warmup=5, iters=100000)
+    results["Preprocess-only: CSC thr_sparsify_to_csc"] = (csc_pre(), lat)
+    print(f"  - thr_sparsify_to_csc: {lat:.4f} ms")
+
+    return results
 
 
 # =============================================================================
@@ -122,7 +523,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr(activation, threshold)
         return icsr_sve_gather_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat1 = measure_latency(icsr_combo1, warmup=5, iters=100)
+    lat1 = measure_latency(icsr_combo1, warmup=5, iters=100000)
     result1 = icsr_combo1()
     results["iCSR-1: thr_sparsify_to_icsr + sparse_gemm_icsr_sve_gather"] = (result1, lat1)
     print(f"  延迟: {lat1:.4f} ms")
@@ -133,7 +534,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve(activation, threshold)
         return icsr_sve_gather_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat2 = measure_latency(icsr_combo2, warmup=5, iters=100)
+    lat2 = measure_latency(icsr_combo2, warmup=5, iters=100000)
     result2 = icsr_combo2()
     results["iCSR-2: thr_sparsify_to_icsr_sve + sparse_gemm_icsr_sve_gather"] = (result2, lat2)
     print(f"  延迟: {lat2:.4f} ms")
@@ -144,7 +545,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr(activation, threshold)
         return icsr_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat3 = measure_latency(icsr_combo3, warmup=5, iters=100)
+    lat3 = measure_latency(icsr_combo3, warmup=5, iters=100000)
     result3 = icsr_combo3()
     results["iCSR-3: thr_sparsify_to_icsr + sparse_gemm_icsr"] = (result3, lat3)
     print(f"  延迟: {lat3:.4f} ms")
@@ -155,7 +556,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve(activation, threshold)
         return icsr_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat4 = measure_latency(icsr_combo4, warmup=5, iters=100)
+    lat4 = measure_latency(icsr_combo4, warmup=5, iters=100000)
     result4 = icsr_combo4()
     results["iCSR-4: thr_sparsify_to_icsr_sve + sparse_gemm_icsr"] = (result4, lat4)
     print(f"  延迟: {lat4:.4f} ms")
@@ -207,7 +608,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr(activation, threshold)
         return csr_op(weight, row_offsets, nz_col_indices, values)
     
-    lat1 = measure_latency(csr_combo1, warmup=5, iters=100)
+    lat1 = measure_latency(csr_combo1, warmup=5, iters=100000)
     result1 = csr_combo1()
     results["CSR-1: thr_sparsify_to_csr + sparse_gemm_csr"] = (result1, lat1)
     print(f"  延迟: {lat1:.4f} ms")
@@ -218,7 +619,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr_sve(activation, threshold)
         return csr_op(weight, row_offsets, nz_col_indices, values)
     
-    lat2 = measure_latency(csr_combo2, warmup=5, iters=100)
+    lat2 = measure_latency(csr_combo2, warmup=5, iters=100000)
     result2 = csr_combo2()
     results["CSR-2: thr_sparsify_to_csr_sve + sparse_gemm_csr"] = (result2, lat2)
     print(f"  延迟: {lat2:.4f} ms")
@@ -229,7 +630,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr(activation, threshold)
         return csr_sve_gather_op(weight, row_offsets, nz_col_indices, values)
     
-    lat3 = measure_latency(csr_combo3, warmup=5, iters=100)
+    lat3 = measure_latency(csr_combo3, warmup=5, iters=100000)
     result3 = csr_combo3()
     results["CSR-3: thr_sparsify_to_csr + sparse_gemm_csr_sve_gather"] = (result3, lat3)
     print(f"  延迟: {lat3:.4f} ms")
@@ -240,7 +641,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr_sve(activation, threshold)
         return csr_sve_gather_op(weight, row_offsets, nz_col_indices, values)
     
-    lat4 = measure_latency(csr_combo4, warmup=5, iters=100)
+    lat4 = measure_latency(csr_combo4, warmup=5, iters=100000)
     result4 = csr_combo4()
     results["CSR-4: thr_sparsify_to_csr_sve + sparse_gemm_csr_sve_gather"] = (result4, lat4)
     print(f"  延迟: {lat4:.4f} ms")
@@ -297,7 +698,7 @@ def test_coo_combinations(
         col_indices_i64 = col_indices.to(torch.int64)
         return coo_op(weight, row_indices, col_indices_i64, values, M)
     
-    lat1 = measure_latency(coo_combo1, warmup=5, iters=1000)
+    lat1 = measure_latency(coo_combo1, warmup=5, iters=100000)
     result1 = coo_combo1()
     results["COO-1: thr_sparsify_to_coo + sparse_gemm_coo"] = (result1, lat1)
     print(f"  延迟: {lat1:.4f} ms")
@@ -310,7 +711,7 @@ def test_coo_combinations(
         col_indices_i64 = col_indices.to(torch.int64)
         return coo_op(weight, row_indices, col_indices_i64, values, M)
     
-    lat2 = measure_latency(coo_combo2, warmup=5, iters=1000)
+    lat2 = measure_latency(coo_combo2, warmup=5, iters=100000)
     result2 = coo_combo2()
     results["COO-2: thr_sparsify_to_coo_sve + sparse_gemm_coo"] = (result2, lat2)
     print(f"  延迟: {lat2:.4f} ms")
@@ -322,7 +723,7 @@ def test_coo_combinations(
         # sparse_gemm_coo_sve_gather 需要 uint32 的 col_indices，已经是 uint32
         return coo_sve_gather_op(weight, row_indices, col_indices, values, M)
     
-    lat3 = measure_latency(coo_combo3, warmup=5, iters=1000)
+    lat3 = measure_latency(coo_combo3, warmup=5, iters=100000)
     result3 = coo_combo3()
     results["COO-3: thr_sparsify_to_coo + sparse_gemm_coo_sve_gather"] = (result3, lat3)
     print(f"  延迟: {lat3:.4f} ms")
@@ -334,7 +735,7 @@ def test_coo_combinations(
         # sparse_gemm_coo_sve_gather 需要 uint32 的 col_indices，已经是 uint32
         return coo_sve_gather_op(weight, row_indices, col_indices, values, M)
     
-    lat4 = measure_latency(coo_combo4, warmup=5, iters=1000)
+    lat4 = measure_latency(coo_combo4, warmup=5, iters=100000)
     result4 = coo_combo4()
     results["COO-4: thr_sparsify_to_coo_sve + sparse_gemm_coo_sve_gather"] = (result4, lat4)
     print(f"  延迟: {lat4:.4f} ms")
@@ -380,7 +781,7 @@ def test_csc_combinations(
         col_ptr, row_indices, values = thr_sparsify_to_csc(activation, threshold)
         return csc_op(weight, col_ptr, row_indices, values, M, 0)
     
-    lat1 = measure_latency(csc_combo1, warmup=5, iters=100)
+    lat1 = measure_latency(csc_combo1, warmup=5, iters=100000)
     result1 = csc_combo1()
     results["CSC-1: thr_sparsify_to_csc + sparse_gemm_csc"] = (result1, lat1)
     print(f"  延迟: {lat1:.4f} ms")
@@ -424,7 +825,7 @@ def test_pytorch_references(
         activation_thresholded = _apply_threshold(activation, threshold=threshold)
         return torch.matmul(activation_thresholded, weight)
     
-    lat1 = measure_latency(pytorch_dense_fn, warmup=5, iters=100)
+    lat1 = measure_latency(pytorch_dense_fn, warmup=5, iters=100000)
     result1 = pytorch_dense_fn()
     results["PyTorch-1: 稠密 matmul"] = (result1, lat1)
     print(f"  延迟: {lat1:.4f} ms")
@@ -436,7 +837,7 @@ def test_pytorch_references(
         sp_act = activation_thresholded.to_sparse_csr()
         return torch.sparse.mm(sp_act, weight)
     
-    lat2 = measure_latency(pytorch_sparse_csr_fn, warmup=5, iters=100)
+    lat2 = measure_latency(pytorch_sparse_csr_fn, warmup=5, iters=100000)
     result2 = pytorch_sparse_csr_fn()
     results["PyTorch-2: 稀疏 CSR + sparse.mm"] = (result2, lat2)
     print(f"  延迟: {lat2:.4f} ms")
@@ -448,7 +849,7 @@ def test_pytorch_references(
         sp_act = activation_thresholded.to_sparse_csc()
         return torch.sparse.mm(sp_act, weight)
     
-    lat3 = measure_latency(pytorch_sparse_csc_fn, warmup=5, iters=100)
+    lat3 = measure_latency(pytorch_sparse_csc_fn, warmup=5, iters=100000)
     result3 = pytorch_sparse_csc_fn()
     results["PyTorch-3: 稀疏 CSC + sparse.mm"] = (result3, lat3)
     print(f"  延迟: {lat3:.4f} ms")
@@ -478,7 +879,7 @@ def test_pytorch_references(
         
         return output
     
-    lat4 = measure_latency(pytorch_selective_weight_fn, warmup=5, iters=100)
+    lat4 = measure_latency(pytorch_selective_weight_fn, warmup=5, iters=100000)
     result4 = pytorch_selective_weight_fn()
     results["PyTorch-4: 选择性加载 weight 非零行 + matmul"] = (result4, lat4)
     print(f"  延迟: {lat4:.4f} ms")
@@ -602,11 +1003,22 @@ def main() -> None:
     """运行所有测试"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--threshold", type=float, default=0.8, help="稀疏化阈值")
-    parser.add_argument("--M", type=int, default=1, help="activation 行数")
+    parser.add_argument("--threshold", type=float, default=0.9, help="稀疏化阈值")
+    parser.add_argument("--M", type=int, default=128, help="activation 行数")
     parser.add_argument("--K", type=int, default=4096, help="activation 列数 / weight 行数")
-    parser.add_argument("--N", type=int, default=11008, help="weight 列数")
+    parser.add_argument("--N", type=int, default=4096, help="weight 列数")
+    parser.add_argument(
+        "--tests",
+        nargs="+",
+        default=["all"],
+        help=(
+            "选择要运行的测试项（空格或逗号分隔）："
+            "all/icsr/csr/coo/csc/pytorch/gemm-only/preprocess-only"
+        ),
+    )
     args = parser.parse_args()
+
+    selected_tests = _parse_selected_tests(args.tests)
     
     print("=" * 80)
     print("ARM SVE 稀疏 GEMM 算子综合测试")
@@ -615,40 +1027,113 @@ def main() -> None:
     print(f"  - 随机种子: {args.seed}")
     print(f"  - 阈值: {args.threshold}")
     print(f"  - 矩阵尺寸: activation ({args.M}, {args.K}), weight ({args.K}, {args.N})")
+    print(f"  - 测试项: {', '.join(selected_tests)}")
     
     try:
+        if psutil is None:
+            print("  - CPU 利用率: psutil 不可用，跳过 CPU 利用率打印（可选安装: pip install psutil）")
+        else:
+            _maybe_print_cpu_util("启动前")
+
         # 加载扩展
         load_sve_sparse_gemm_extension(verbose=False)
         
         # 生成共享的测试数据
         activation = _make_random_sparse_activation(args.M, args.K, seed=args.seed)
-        weight = torch.randn(args.K, args.N, dtype=torch.float32)
-        
-        # 计算参考结果
         activation_thresholded = _apply_threshold(activation, threshold=args.threshold)
-        reference = torch.matmul(activation_thresholded, weight)
-        
+
         # 计算稀疏度
         nnz = torch.count_nonzero(activation_thresholded).item()
         sparsity = 100.0 * (1.0 - nnz / (args.M * args.K))
         print(f"  - 稀疏度: {sparsity:.1f}% ({nnz}/{args.M * args.K} 非零元素)")
+
+        needs_weight = any(
+            t in {"icsr", "csr", "coo", "csc", "pytorch", "gemm-only"} for t in selected_tests
+        )
+        needs_reference = any(
+            t in {"icsr", "csr", "coo", "csc", "pytorch", "gemm-only"} for t in selected_tests
+        )
+
+        weight = None
+        reference = None
+        if needs_weight:
+            weight = torch.randn(args.K, args.N, dtype=torch.float32)
+        if needs_reference:
+            if weight is None:
+                raise RuntimeError("内部错误：needs_reference=True 但 weight 未生成")
+            reference = torch.matmul(activation_thresholded, weight)
         
-        # 测试所有格式组合
-        all_results = {}
-        
-        all_results["iCSR"] = test_icsr_combinations(activation, weight, args.threshold)
-        all_results["CSR"] = test_csr_combinations(activation, weight, args.threshold)
-        all_results["COO"] = test_coo_combinations(activation, weight, args.threshold)
-        all_results["CSC"] = test_csc_combinations(activation, weight, args.threshold)
-        
-        # 测试 PyTorch 参考实现
-        all_results["PyTorch"] = test_pytorch_references(activation, weight, args.threshold)
-        
-        # 验证正确性
-        verify_correctness(all_results, reference)
-        
-        # 打印性能总结
-        print_performance_summary(all_results)
+        # 组合/参考实现测试（会参与 correctness + summary）
+        all_results: Dict[str, Dict[str, Tuple[torch.Tensor, float]]] = {}
+        if any(t in {"icsr", "csr", "coo", "csc", "pytorch"} for t in selected_tests):
+            if weight is None or reference is None:
+                raise RuntimeError("内部错误：需要 weight/reference 但未生成")
+
+            if "icsr" in selected_tests:
+                _maybe_print_cpu_util("开始 iCSR")
+                all_results["iCSR"] = test_icsr_combinations(activation, weight, args.threshold)
+                _maybe_print_cpu_util("结束 iCSR")
+            if "csr" in selected_tests:
+                _maybe_print_cpu_util("开始 CSR")
+                all_results["CSR"] = test_csr_combinations(activation, weight, args.threshold)
+                _maybe_print_cpu_util("结束 CSR")
+            if "coo" in selected_tests:
+                _maybe_print_cpu_util("开始 COO")
+                all_results["COO"] = test_coo_combinations(activation, weight, args.threshold)
+                _maybe_print_cpu_util("结束 COO")
+            if "csc" in selected_tests:
+                _maybe_print_cpu_util("开始 CSC")
+                all_results["CSC"] = test_csc_combinations(activation, weight, args.threshold)
+                _maybe_print_cpu_util("结束 CSC")
+            if "pytorch" in selected_tests:
+                _maybe_print_cpu_util("开始 PyTorch 参考")
+                all_results["PyTorch"] = test_pytorch_references(activation, weight, args.threshold)
+                _maybe_print_cpu_util("结束 PyTorch 参考")
+
+            # 验证正确性 + 性能总结
+            verify_correctness(all_results, reference)
+            print_performance_summary(all_results)
+
+        # 额外测试 1：只测试核心乘法（GEMM-only）
+        if "gemm-only" in selected_tests:
+            if weight is None or reference is None:
+                raise RuntimeError("GEMM-only 测试需要 weight/reference，但当前未生成（请检查 --tests）")
+
+            _maybe_print_cpu_util("开始 GEMM-only")
+            gemm_only_results = test_core_gemm_only(
+                activation=activation,
+                activation_thresholded=activation_thresholded,
+                weight=weight,
+                threshold=args.threshold,
+            )
+            _maybe_print_cpu_util("结束 GEMM-only")
+            verify_correctness_flat(gemm_only_results, reference)
+            baseline_gemm_latency = gemm_only_results[
+                "GEMM-only: PyTorch torch.matmul(thresholded, weight)"
+            ][1]
+            _print_ranked_latencies(
+                title="核心乘法（GEMM-only）延迟排名（baseline=PyTorch torch.matmul）",
+                latencies=[(k, v[1]) for k, v in gemm_only_results.items()],
+                baseline_latency=baseline_gemm_latency,
+            )
+
+        # 额外测试 2：只测试输入稀疏矩阵处理（Preprocess-only）
+        if "preprocess-only" in selected_tests:
+            _maybe_print_cpu_util("开始 Preprocess-only")
+            preprocess_only_results = test_preprocess_only(
+                activation=activation,
+                threshold=args.threshold,
+            )
+            _maybe_print_cpu_util("结束 Preprocess-only")
+            # 以 PyTorch threshold-only 作为 baseline（最小化的预处理基准）
+            baseline_pre_latency = preprocess_only_results[
+                "Preprocess-only: PyTorch _apply_threshold(abs>=thr)"
+            ][1]
+            _print_ranked_latencies(
+                title="输入稀疏矩阵处理（Preprocess-only）延迟排名（baseline=PyTorch _apply_threshold）",
+                latencies=[(k, v[1]) for k, v in preprocess_only_results.items()],
+                baseline_latency=baseline_pre_latency,
+            )
         
         print("\n" + "=" * 80)
         print("✅ 所有测试完成")

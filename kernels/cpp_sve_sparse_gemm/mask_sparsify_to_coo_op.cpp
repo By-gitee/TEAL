@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <vector>
-#include <cmath>
 #include <cstring>   // memcpy
 #include <algorithm>
 
@@ -12,29 +11,29 @@
 
 using torch::Tensor;
 
-static inline void check_thr_sparsify_to_coo_inputs(const Tensor& activation) {
+static inline void check_mask_sparsify_to_coo_inputs(const Tensor& activation, const Tensor& mask) {
   TORCH_CHECK(activation.device().is_cpu(), "activation must be a CPU tensor");
   TORCH_CHECK(activation.dtype() == torch::kFloat32, "activation must be float32");
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D [M, K]");
-}
-
-// Fast abs without calling libm (bit trick). Works for IEEE-754 float.
-static inline float abs_f32_fast(float x) {
-  union { float f; uint32_t u; } v;
-  v.f = x;
-  v.u &= 0x7FFFFFFFu;
-  return v.f;
+  
+  TORCH_CHECK(mask.device().is_cpu(), "mask must be a CPU tensor");
+  TORCH_CHECK(mask.dtype() == torch::kUInt8, "mask must be uint8");
+  TORCH_CHECK(mask.is_contiguous(), "mask must be contiguous");
+  TORCH_CHECK(mask.dim() == 2, "mask must be 2D [M, K]");
+  
+  TORCH_CHECK(activation.size(0) == mask.size(0) && activation.size(1) == mask.size(1),
+              "activation and mask must have the same shape");
 }
 
 /**
- * thr_sparsify_to_coo(activation, threshold) -> (row_indices, col_indices, values)
+ * mask_sparsify_to_coo(activation, mask) -> (row_indices, col_indices, values)
  * 
- * 将稠密矩阵根据阈值转换为 COO 格式的稀疏矩阵。
+ * 根据 mask 将稠密矩阵转换为 COO 格式的稀疏矩阵。
  * 
  * Args:
  *   activation: (M, K) float32 稠密矩阵
- *   threshold: float 阈值，绝对值 >= threshold 的元素被保留
+ *   mask: (M, K) uint8 掩码矩阵，非零元素标记需要保留的位置
  * 
  * Returns:
  *   row_indices: int64 [nnz] 行索引数组（已按行排序）
@@ -47,13 +46,13 @@ static inline float abs_f32_fast(float x) {
  *   Pass 3: 并行填充 COO 三元组 (row_idx, col_idx, value)
  */
 static std::tuple<Tensor, Tensor, Tensor>
-thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
-  check_thr_sparsify_to_coo_inputs(activation);
+mask_sparsify_to_coo(torch::Tensor activation, torch::Tensor mask) {
+  check_mask_sparsify_to_coo_inputs(activation, mask);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
   const float* act_ptr = activation.data_ptr<float>();
-  const float thr = static_cast<float>(threshold);
+  const uint8_t* mask_ptr = mask.data_ptr<uint8_t>();
 
   // counts per row (int64)
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
@@ -64,17 +63,16 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
 #pragma omp parallel for schedule(static)
 #endif
   for (int64_t m = 0; m < M; ++m) {
-    const float* row = act_ptr + m * K;
+    const uint8_t* mask_row = mask_ptr + m * K;
     int64_t nnz = 0;
 
     // Help auto-vectorization: simple loop + simd reduction.
-    // Use abs_f32_fast to avoid std::fabs overhead and keep float domain.
+    // Count non-zero mask elements.
 #if defined(_OPENMP)
 #pragma omp simd reduction(+:nnz)
 #endif
     for (int64_t k = 0; k < K; ++k) {
-      const float ax = abs_f32_fast(row[k]);
-      nnz += (ax >= thr);
+      nnz += (mask_row[k] != 0);
     }
 
     counts[m] = nnz;
@@ -108,23 +106,24 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
     const int64_t nnz = counts[m];
     if (nnz == 0) continue;
 
-    const float* row = act_ptr + m * K;
+    const float* act_row = act_ptr + m * K;
+    const uint8_t* mask_row = mask_ptr + m * K;
     int64_t* __restrict dst_row = out_row + row_offsets[m];
     uint32_t* __restrict dst_col = out_col + row_offsets[m];
     float* __restrict dst_val = out_val + row_offsets[m];
     int64_t write_pos = 0;
 
-    // Full-keep fast path: all elements in the row exceed threshold
+    // Full-keep fast path: all elements in the row are masked
     if (nnz == K) {
       // sequential fill
       for (int64_t k = 0; k < K; ++k) {
         dst_row[k] = m;
         dst_col[k] = (uint32_t)k;
-        dst_val[k] = row[k];
+        dst_val[k] = act_row[k];
       }
       write_pos = K;
 #ifndef NDEBUG
-      TORCH_CHECK(write_pos == nnz, "thr_sparsify_to_coo: nnz==K fastpath mismatch");
+      TORCH_CHECK(write_pos == nnz, "mask_sparsify_to_coo: nnz==K fastpath mismatch");
 #endif
       continue;
     }
@@ -141,20 +140,20 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
 
     // mild unroll by 4 to reduce loop overhead; keeps code simple for compiler.
     for (; k + 4 <= K; k += 4) {
-      const float x0 = row[k + 0];
-      const float x1 = row[k + 1];
-      const float x2 = row[k + 2];
-      const float x3 = row[k + 3];
+      const uint8_t m0 = mask_row[k + 0];
+      const uint8_t m1 = mask_row[k + 1];
+      const uint8_t m2 = mask_row[k + 2];
+      const uint8_t m3 = mask_row[k + 3];
 
-      const bool keep0 = (abs_f32_fast(x0) >= thr);
-      const bool keep1 = (abs_f32_fast(x1) >= thr);
-      const bool keep2 = (abs_f32_fast(x2) >= thr);
-      const bool keep3 = (abs_f32_fast(x3) >= thr);
+      const bool keep0 = (m0 != 0);
+      const bool keep1 = (m1 != 0);
+      const bool keep2 = (m2 != 0);
+      const bool keep3 = (m3 != 0);
 
-      if (keep0) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 0); val_buf[buf_n] = x0; ++buf_n; }
-      if (keep1) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 1); val_buf[buf_n] = x1; ++buf_n; }
-      if (keep2) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 2); val_buf[buf_n] = x2; ++buf_n; }
-      if (keep3) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 3); val_buf[buf_n] = x3; ++buf_n; }
+      if (keep0) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 0); val_buf[buf_n] = act_row[k + 0]; ++buf_n; }
+      if (keep1) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 1); val_buf[buf_n] = act_row[k + 1]; ++buf_n; }
+      if (keep2) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 2); val_buf[buf_n] = act_row[k + 2]; ++buf_n; }
+      if (keep3) { row_buf[buf_n] = m; col_buf[buf_n] = (uint32_t)(k + 3); val_buf[buf_n] = act_row[k + 3]; ++buf_n; }
 
       // flush if buffer is getting full
       if (buf_n >= BUFSZ - 4) {
@@ -168,11 +167,10 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
 
     // tail
     for (; k < K; ++k) {
-      const float x = row[k];
-      if (abs_f32_fast(x) >= thr) {
+      if (mask_row[k] != 0) {
         row_buf[buf_n] = m;
         col_buf[buf_n] = (uint32_t)k;
-        val_buf[buf_n] = x;
+        val_buf[buf_n] = act_row[k];
         ++buf_n;
         if (buf_n == BUFSZ) {
           std::memcpy(dst_row + write_pos, row_buf, (size_t)buf_n * sizeof(int64_t));
@@ -194,7 +192,7 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
 
 #ifndef NDEBUG
     TORCH_CHECK (write_pos == nnz,
-                "thr_sparsify_to_coo: write_pos != nnz at row ", m,
+                "mask_sparsify_to_coo: write_pos != nnz at row ", m,
                 " write_pos=", write_pos, " nnz=", nnz);
 #endif
   }
@@ -206,9 +204,9 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
 // 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
 // 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
-  m.def("thr_sparsify_to_coo(Tensor activation, float threshold) -> (Tensor row_indices, Tensor col_indices, Tensor values)");
+  m.def("mask_sparsify_to_coo(Tensor activation, Tensor mask) -> (Tensor row_indices, Tensor col_indices, Tensor values)");
 }
 
 TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
-  m.impl("thr_sparsify_to_coo", thr_sparsify_to_coo);
+  m.impl("mask_sparsify_to_coo", mask_sparsify_to_coo);
 }

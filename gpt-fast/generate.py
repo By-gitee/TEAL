@@ -308,7 +308,7 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.feed_forward.thresh_gate = sparses["gate"]
         layer.feed_forward.sparsity_bin = 0
         layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.data.T.contiguous().T # column major
-        layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous().T # column major
+        layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous().T # T.c.T -> NxK T.c -> KxN . -> NxK column major torch.matmul(x,W.T) W.T -> KxN  W -> NxK
 
         layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
         layer.feed_forward.gemv2 = layer.feed_forward.gemv2_kernel.operator(True)

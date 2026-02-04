@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <vector>
-#include <cmath>
 #include <cstring>
 #include <algorithm>
 
@@ -10,35 +9,50 @@
 #include <omp.h>
 #endif
 
-#if defined(__ARM_FEATURE_SVE)
-#include <arm_sve.h>
-#endif
-
 using torch::Tensor;
 
-static inline void check_thr_sparsify_to_csc_inputs(const Tensor& activation) {
+static inline void check_mask_sparsify_to_csc_inputs(const Tensor& activation, const Tensor& mask) {
   TORCH_CHECK(activation.device().is_cpu(), "activation must be a CPU tensor");
   TORCH_CHECK(activation.dtype() == torch::kFloat32, "activation must be float32");
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D [M, K]");
+  
+  TORCH_CHECK(mask.device().is_cpu(), "mask must be a CPU tensor");
+  TORCH_CHECK(mask.dtype() == torch::kUInt8, "mask must be uint8");
+  TORCH_CHECK(mask.is_contiguous(), "mask must be contiguous");
+  TORCH_CHECK(mask.dim() == 2, "mask must be 2D [M, K]");
+  
+  TORCH_CHECK(activation.size(0) == mask.size(0) && activation.size(1) == mask.size(1),
+              "activation and mask must have the same shape");
 }
 
-// Fast abs without libm
-static inline float abs_f32_fast(float x) {
-  union { float f; uint32_t u; } v;
-  v.f = x;
-  v.u &= 0x7FFFFFFFu;
-  return v.f;
-}
-
+/**
+ * mask_sparsify_to_csc(activation, mask) -> (col_ptr, row_indices, values)
+ * 
+ * 根据 mask 将稠密矩阵转换为 CSC (Compressed Sparse Column) 格式的稀疏矩阵。
+ * 
+ * Args:
+ *   activation: (M, K) float32 稠密矩阵
+ *   mask: (M, K) uint8 掩码矩阵，非零元素标记需要保留的位置
+ * 
+ * Returns:
+ *   col_ptr: int64 [K+1] 列指针数组
+ *   row_indices: uint32 [nnz] 行索引数组（每列内按行排序）
+ *   values: float32 [nnz] 非零元素值数组
+ * 
+ * 实现策略：
+ *   Pass 1: 并行统计每列的非零元素数量（使用线程局部计数）
+ *   Pass 2: 规约线程局部计数，构建列指针（前缀和）
+ *   Pass 3: 并行填充 CSC 数据结构（row_indices, values）
+ */
 static std::tuple<Tensor, Tensor, Tensor>
-thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
-  check_thr_sparsify_to_csc_inputs(activation);
+mask_sparsify_to_csc(torch::Tensor activation, torch::Tensor mask) {
+  check_mask_sparsify_to_csc_inputs(activation, mask);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
   const float* act_ptr = activation.data_ptr<float>();
-  const float thr = static_cast<float>(threshold);
+  const uint8_t* mask_ptr = mask.data_ptr<uint8_t>();
 
   int num_threads = 1;
 #ifdef _OPENMP
@@ -58,47 +72,21 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
 #endif
     uint32_t* my_counts = local_counts.data() + (size_t)tid * (size_t)K;
 
-#if defined(__ARM_FEATURE_SVE)
-    const svuint32_t vone = svdup_u32(1);
-    const svuint32_t vzero = svdup_u32(0);
-    const svfloat32_t vthr = svdup_f32(thr);
-    const int64_t vl = (int64_t)svcntw();  // number of f32 lanes
-#endif
-
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
     for (int64_t m = 0; m < M; ++m) {
-      const float* row = act_ptr + m * K;
+      const uint8_t* mask_row = mask_ptr + m * K;
 
-#if defined(__ARM_FEATURE_SVE)
       // Vectorized per-column counting:
-      // counts[k:k+vl] += (abs(row[k:k+vl]) >= thr) ? 1 : 0
-      int64_t k = 0;
-      for (; k < K; k += vl) {
-        const svbool_t pg = svwhilelt_b32(k, K);
-
-        // load activation block
-        const svfloat32_t x = svld1_f32(pg, row + k);
-
-        // abs + compare
-        const svfloat32_t ax = svabs_f32_x(pg, x);
-        const svbool_t keep = svcmpge_f32(pg, ax, vthr);
-
-        // load counts, add predicate-as-0/1, store back
-        svuint32_t c = svld1_u32(pg, my_counts + k);
-        const svuint32_t inc = svsel_u32(keep, vone, vzero);
-        c = svadd_u32_x(pg, c, inc);
-        svst1_u32(pg, my_counts + k, c);
-      }
-#else
-      // Scalar fallback
-      for (int64_t k = 0; k < K; ++k) {
-        if (abs_f32_fast(row[k]) >= thr) {
-          my_counts[k] += 1;
-        }
-      }
+      // counts[k] += (mask_row[k] != 0) ? 1 : 0
+      // Help auto-vectorization with simple loop
+#if defined(_OPENMP)
+#pragma omp simd
 #endif
+      for (int64_t k = 0; k < K; ++k) {
+        my_counts[k] += (mask_row[k] != 0);
+      }
     }
   }
 
@@ -147,7 +135,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
       run += (int64_t)local_counts[(size_t)t * (size_t)K + kk];
     }
 #ifndef NDEBUG
-    TORCH_CHECK(run == col_counts[kk], "thr_sparsify_to_csc: count mismatch at col ", k);
+    TORCH_CHECK(run == col_counts[kk], "mask_sparsify_to_csc: count mismatch at col ", k);
 #endif
   }
 
@@ -171,11 +159,12 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
 #pragma omp for schedule(static)
 #endif
     for (int64_t m = 0; m < M; ++m) {
-      const float* row = act_ptr + m * K;
+      const float* act_row = act_ptr + m * K;
+      const uint8_t* mask_row = mask_ptr + m * K;
 
       for (int64_t k = 0; k < K; ++k) {
-        const float x = row[k];
-        if (abs_f32_fast(x) >= thr) {
+        if (mask_row[k] != 0) {
+          const float x = act_row[k];
           const int64_t p = pos[(size_t)k]++;
           out_row[p] = (uint32_t)m;
           out_val[p] = x;
@@ -190,7 +179,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
       const size_t kk2 = (size_t)k2;
       TORCH_CHECK(
           pos[kk2] == my_base[kk2] + (int64_t)my_cnt[kk2],
-          "thr_sparsify_to_csc: thread write mismatch at tid=", tid, " col=", k2);
+          "mask_sparsify_to_csc: thread write mismatch at tid=", tid, " col=", k2);
     }
 #endif
   }
@@ -198,10 +187,13 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
   return {col_ptr, row_indices, values};
 }
 
+// 注册到 PyTorch
+// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
+// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
-  m.def("thr_sparsify_to_csc(Tensor activation, float threshold) -> (Tensor col_ptr, Tensor row_indices, Tensor values)");
+  m.def("mask_sparsify_to_csc(Tensor activation, Tensor mask) -> (Tensor col_ptr, Tensor row_indices, Tensor values)");
 }
 
 TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
-  m.impl("thr_sparsify_to_csc", thr_sparsify_to_csc);
+  m.impl("mask_sparsify_to_csc", mask_sparsify_to_csc);
 }

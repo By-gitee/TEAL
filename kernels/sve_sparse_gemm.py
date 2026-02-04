@@ -58,7 +58,7 @@ def _extra_cflags() -> list[str]:
     flags = ["-std=c++17", "-O3", "-fopenmp"]
     arch = platform.machine().lower()
     if arch in {"aarch64", "arm64"}:
-        flags.append("-march=armv8-a+sve")
+        flags.append("-march=armv8-a+sve2")
     return flags
 
 
@@ -89,11 +89,18 @@ def load_sve_sparse_gemm_extension(
         and hasattr(torch.ops.sparse_op, "sparse_gemm_coo_sve_gather")
         and hasattr(torch.ops.sparse_op, "thr_sparsify_to_icsr")
         and hasattr(torch.ops.sparse_op, "thr_sparsify_to_icsr_sve")
+        and hasattr(torch.ops.sparse_op, "thr_sparsify_to_icsr_sve_baseline")
         and hasattr(torch.ops.sparse_op, "thr_sparsify_to_csr")
         and hasattr(torch.ops.sparse_op, "thr_sparsify_to_csr_sve")
         and hasattr(torch.ops.sparse_op, "thr_sparsify_to_coo")
         and hasattr(torch.ops.sparse_op, "thr_sparsify_to_coo_sve")
         and hasattr(torch.ops.sparse_op, "thr_sparsify_to_csc")
+        and hasattr(torch.ops.sparse_op, "mask_sparsify_to_icsr")
+        and hasattr(torch.ops.sparse_op, "mask_sparsify_to_icsr_sve")
+        and hasattr(torch.ops.sparse_op, "mask_sparsify_to_csr")
+        and hasattr(torch.ops.sparse_op, "mask_sparsify_to_csr_sve")
+        and hasattr(torch.ops.sparse_op, "mask_sparsify_to_coo")
+        and hasattr(torch.ops.sparse_op, "mask_sparsify_to_coo_sve")
     ):
         return None
 
@@ -110,11 +117,19 @@ def load_sve_sparse_gemm_extension(
             str(CPP_ROOT / "sparse_gemm_coo_sve_gather_op.cpp"),
             str(CPP_ROOT / "thr_sparsify_to_icsr_op.cpp"),
             str(CPP_ROOT / "thr_sparsify_to_icsr_sve_op.cpp"),
+            str(CPP_ROOT / "thr_sparsify_to_icsr_sve_baseline_op.cpp"),
             str(CPP_ROOT / "thr_sparsify_to_csr_op.cpp"),
             str(CPP_ROOT / "thr_sparsify_to_csr_sve_op.cpp"),
             str(CPP_ROOT / "thr_sparsify_to_coo_op.cpp"),
             str(CPP_ROOT / "thr_sparsify_to_coo_sve_op.cpp"),
             str(CPP_ROOT / "thr_sparsify_to_csc_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_icsr_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_icsr_sve_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_csr_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_csr_sve_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_coo_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_coo_sve_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_csc_op.cpp"),
         ],
         build_directory=str(BUILD_DIR),
         extra_cflags=_extra_cflags(),
@@ -478,6 +493,30 @@ def thr_sparsify_to_icsr_sve(activation: torch.Tensor, threshold: float, verbose
     return torch.ops.sparse_op.thr_sparsify_to_icsr_sve(activation, float(threshold))
 
 
+def thr_sparsify_to_icsr_sve_baseline(activation: torch.Tensor, threshold: float, verbose: bool = False):
+    """
+    基于阈值的稠密→iCSR 稀疏化（SVE Baseline版本，不使用SVE2 compact指令）。
+    
+    该版本作为公平的对比baseline，用于量化SVE2 compact指令的性能收益。
+    与SVE2版本的区别仅在于：
+    - Pass2中不使用 svcompact_u32 指令，改用手动循环提取满足条件的索引
+    - Pass1和其他所有优化（多线程、向量化、循环展开）保持完全一致
+
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        threshold: float，阈值，绝对值大于等于该值的元素被视为非零
+        verbose: bool，是否显示编译信息
+
+    Returns:
+        tuple: (nz_counts, nz_col_indices, row_offsets)
+            - nz_counts: int64 tensor，长度为 2 * num_nz_rows，成对存储 (row_idx, count)
+            - nz_col_indices: uint32 tensor，扁平化的列索引向量
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.thr_sparsify_to_icsr_sve_baseline(activation, float(threshold))
+
+
 # Naive version (parallel but no SVE)
 def thr_sparsify_to_icsr(activation: torch.Tensor, threshold: float, verbose: bool = False):
     """
@@ -593,6 +632,137 @@ def thr_sparsify_to_csc(activation: torch.Tensor, threshold: float, verbose: boo
     return torch.ops.sparse_op.thr_sparsify_to_csc(activation, float(threshold))
 
 
+def mask_sparsify_to_icsr(mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→iCSR 稀疏化（OpenMP 并行版本）。
+
+    Args:
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+
+    Returns:
+        tuple: (nz_counts, nz_col_indices, row_offsets)
+            - nz_counts: int64 tensor，长度为 2 * num_nz_rows，成对存储 (row_idx, count)
+            - nz_col_indices: uint32 tensor，扁平化的列索引向量
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_icsr(mask)
+
+
+def mask_sparsify_to_icsr_sve(mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→iCSR 稀疏化（SVE/SVE2 加速版本）。
+
+    Args:
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+
+    Returns:
+        tuple: (nz_counts, nz_col_indices, row_offsets)
+            - nz_counts: int64 tensor，长度为 2 * num_nz_rows，成对存储 (row_idx, count)
+            - nz_col_indices: uint32 tensor，扁平化的列索引向量
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_icsr_sve(mask)
+
+
+def mask_sparsify_to_csr(activation: torch.Tensor, mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→CSR 稀疏化（OpenMP 并行版本）。
+
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (row_offsets, nz_col_indices, values)
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+            - nz_col_indices: uint32 tensor，列索引向量
+            - values: float32 tensor，非零元素值
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_csr(activation, mask)
+
+
+def mask_sparsify_to_csr_sve(activation: torch.Tensor, mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→CSR 稀疏化（SVE/SVE2 优化版本）。
+
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (row_offsets, nz_col_indices, values)
+            - row_offsets: int64 tensor，长度为 M+1，前缀和偏移量
+            - nz_col_indices: uint32 tensor，列索引向量
+            - values: float32 tensor，非零元素值
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_csr_sve(activation, mask)
+
+
+def mask_sparsify_to_coo(activation: torch.Tensor, mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→COO 稀疏化（OpenMP 并行版本）。
+
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (row_indices, col_indices, values)
+            - row_indices: int64 tensor，长度为 nnz，行索引数组（已按行排序）
+            - col_indices: uint32 tensor，长度为 nnz，列索引数组
+            - values: float32 tensor，长度为 nnz，非零元素值数组
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_coo(activation, mask)
+
+
+def mask_sparsify_to_coo_sve(activation: torch.Tensor, mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→COO 稀疏化（SVE/SVE2 加速版本）。
+
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (row_indices, col_indices, values)
+            - row_indices: int64 tensor，长度为 nnz，行索引数组（已按行排序）
+            - col_indices: uint32 tensor，长度为 nnz，列索引数组
+            - values: float32 tensor，长度为 nnz，非零元素值数组
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_coo_sve(activation, mask)
+
+
+def mask_sparsify_to_csc(activation: torch.Tensor, mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→CSC 稀疏化（OpenMP 并行版本）。
+
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (col_ptr, row_indices, values)
+            - col_ptr: int64 tensor，长度为 K+1，列指针数组
+            - row_indices: uint32 tensor，长度为 nnz，行索引数组（每列内按行排序）
+            - values: float32 tensor，长度为 nnz，非零元素值数组
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_csc(activation, mask)
+
+
 # -----------------------------------------------------------------------------
 # 兼容层：保持旧导入路径/符号名可用
 # -----------------------------------------------------------------------------
@@ -621,9 +791,17 @@ __all__ = [
     # sparsifiers
     "thr_sparsify_to_icsr",
     "thr_sparsify_to_icsr_sve",
+    "thr_sparsify_to_icsr_sve_baseline",
     "thr_sparsify_to_csr",
     "thr_sparsify_to_csr_sve",
     "thr_sparsify_to_coo",
     "thr_sparsify_to_coo_sve",
     "thr_sparsify_to_csc",
+    "mask_sparsify_to_icsr",
+    "mask_sparsify_to_icsr_sve",
+    "mask_sparsify_to_csr",
+    "mask_sparsify_to_csr_sve",
+    "mask_sparsify_to_coo",
+    "mask_sparsify_to_coo_sve",
+    "mask_sparsify_to_csc",
 ]
