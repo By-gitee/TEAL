@@ -101,6 +101,7 @@ def load_sve_sparse_gemm_extension(
         and hasattr(torch.ops.sparse_op, "mask_sparsify_to_csr_sve")
         and hasattr(torch.ops.sparse_op, "mask_sparsify_to_coo")
         and hasattr(torch.ops.sparse_op, "mask_sparsify_to_coo_sve")
+        and hasattr(torch.ops.sparse_op, "mask_sparsify_to_csc_scatter")
     ):
         return None
 
@@ -130,6 +131,7 @@ def load_sve_sparse_gemm_extension(
             str(CPP_ROOT / "mask_sparsify_to_coo_op.cpp"),
             str(CPP_ROOT / "mask_sparsify_to_coo_sve_op.cpp"),
             str(CPP_ROOT / "mask_sparsify_to_csc_op.cpp"),
+            str(CPP_ROOT / "mask_sparsify_to_csc_scatter_op.cpp"),
         ],
         build_directory=str(BUILD_DIR),
         extra_cflags=_extra_cflags(),
@@ -763,6 +765,29 @@ def mask_sparsify_to_csc(activation: torch.Tensor, mask: torch.Tensor, verbose: 
     return torch.ops.sparse_op.mask_sparsify_to_csc(activation, mask)
 
 
+def mask_sparsify_to_csc_scatter(activation: torch.Tensor, mask: torch.Tensor, verbose: bool = False):
+    """
+    基于 mask 的稠密→CSC 稀疏化（SVE scatter store 优化版本）。
+
+    该版本使用 SVE scatter store 指令进行优化，避免了写入冲突。
+    在 total_nnz 适合 u32 范围时，使用 SVE scatter store 直接写入每列桶中，
+    相比标量版本可以获得更好的性能。
+
+    Args:
+        activation: (M, K) float32 CPU tensor，激活矩阵
+        mask: (M, K) uint8 CPU tensor，mask 矩阵（非零元素表示有效位置）
+        verbose: bool，是否显示编译信息
+    
+    Returns:
+        tuple: (col_ptr, row_indices, values)
+            - col_ptr: int64 tensor，长度为 K+1，列指针数组
+            - row_indices: uint32 tensor，长度为 nnz，行索引数组（每列内按行排序）
+            - values: float32 tensor，长度为 nnz，非零元素值数组
+    """
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.sparse_op.mask_sparsify_to_csc_scatter(activation, mask)
+
+
 # -----------------------------------------------------------------------------
 # 兼容层：保持旧导入路径/符号名可用
 # -----------------------------------------------------------------------------
@@ -804,4 +829,5 @@ __all__ = [
     "mask_sparsify_to_coo",
     "mask_sparsify_to_coo_sve",
     "mask_sparsify_to_csc",
+    "mask_sparsify_to_csc_scatter",
 ]
