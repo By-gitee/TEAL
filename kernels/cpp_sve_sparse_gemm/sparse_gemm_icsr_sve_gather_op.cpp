@@ -1,15 +1,30 @@
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
-#include <omp.h>
 #include <limits>
+#include <omp.h>
 #include <vector>
 
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 #endif
 
+/**
+ * iCSR(index-only CSR) × dense weight with SVE gather optimization
+ *
+ * Input:
+ *   - activation: (M, K) float32 contiguous CPU
+ *   - weight: (K, N) float32 contiguous CPU
+ *   - row_offsets: 1D int64 length=M+1 (CSR row pointers)
+ *   - nz_col_indices: 1D uint32 length=nnz (CSR column indices)
+ *
+ * Computation:
+ *   For each row i and its non-zeros (k, a):
+ *     out[i, :] += a * weight[k, :]
+ *   Optimized with SVE gather load for both activation and weight matrix access
+ */
 
 void check_sparse_gemv_icsr_sve_gather_inputs(
     const torch::Tensor& activation,
@@ -69,64 +84,39 @@ torch::Tensor sparse_gemv_icsr_sve_gather(
     const int64_t vl = svcntw();
     const uint32_t N_u32 = static_cast<uint32_t>(N);
 
-    // N-dimension blocking (aligned with sparse_gemm_icsr_sve_gather's n_block_sz idea)
-    int64_t n_block_sz = N / 16;
-    if (n_block_sz < 4) {
-      n_block_sz = 4;
-    }
-    const int64_t n_full = (N / n_block_sz) * n_block_sz;
-    const int64_t rem = N - n_full;
+    const int64_t block_sz = std::max<int64_t>(1, N / 16);
+    const int64_t n_block = (N + block_sz - 1) / block_sz;
 
     #pragma omp parallel
     {
-      // Full blocks: parallelize over N-blocks, each block accumulates locally then writes once.
+      std::vector<float> acc_buf;
+      acc_buf.resize((size_t)block_sz);
+
       #pragma omp for schedule(static)
-      for (int64_t n = 0; n < n_full; n += n_block_sz) {
-        std::vector<float> acc(n_block_sz, 0.0f);
-        const float* base = weight_ptr + n;
+      for (int64_t nb = 0; nb < n_block; ++nb) {
+        const int64_t n0 = nb * block_sz;
+        const int64_t n_valid = std::min<int64_t>(block_sz, N - n0);
+        float* acc = acc_buf.data();
+
+        std::fill_n(acc, (size_t)n_valid, 0.0f);
+        const float* base = weight_ptr + n0;
 
         for (int64_t i = 0; i < nnz; i += vl) {
           const svbool_t pg = svwhilelt_b32(i, nnz);
           const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
           const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
-          const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);  // idx * N
+          const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
 
-          for (int64_t r = 0; r < n_block_sz; ++r) {
+          for (int64_t r = 0; r < n_valid; ++r) {
             const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
             acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
           }
         }
 
-        for (int64_t r = 0; r < n_block_sz; ++r) {
-          out_ptr[n + r] += acc[r];
-        }
-      }  
-
-      // Tail: one last partial block (small), computed once.
-      if (rem > 0) {
-        #pragma omp single
-        {
-          const int64_t n_start = n_full;
-          std::vector<float> acc(rem, 0.0f);
-
-          for (int64_t i = 0; i < nnz; i += vl) {
-            const svbool_t pg = svwhilelt_b32(i, nnz);
-            const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
-            const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
-            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);  // idx * N
-
-            for (int64_t r = 0; r < rem; ++r) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, weight_ptr + (n_start + r), w_index);
-              acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
-            }
-          }
-
-          for (int64_t r = 0; r < rem; ++r) {
-            out_ptr[n_start + r] += acc[r];
-          }
-        }
+        float* out_tile = out_ptr + n0;
+        for (int64_t r = 0; r < n_valid; ++r) out_tile[r] = acc[r];
       }
-    }  
+    }
 
     return output;
 #endif
@@ -149,7 +139,6 @@ torch::Tensor sparse_gemv_icsr_sve_gather(
 
 
 
-// Check inputs for sparse GEMM operation
 void check_sparse_gemm_icsr_sve_gather_inputs(
     const torch::Tensor& activation,
     const torch::Tensor& weight,
@@ -186,15 +175,12 @@ void check_sparse_gemm_icsr_sve_gather_inputs(
               "row_offsets[M] must equal nz_col_indices size");
 }
 
-// Sparse GEMM: (M, K) sparse × (K, N) dense → (M, N)
-// row_offsets: int64 [M+1], prefix sum offsets for each row in nz_col_indices
-// nz_col_indices: flattened column indices for all non-zero elements
 torch::Tensor sparse_gemm_icsr_sve_gather(
     torch::Tensor activation,
     torch::Tensor weight,
     torch::Tensor row_offsets,
     torch::Tensor nz_col_indices) {
-  // check_sparse_gemm_icsr_sve_gather_inputs(activation, weight, row_offsets, nz_col_indices);
+  check_sparse_gemm_icsr_sve_gather_inputs(activation, weight, row_offsets, nz_col_indices);
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
@@ -214,81 +200,66 @@ torch::Tensor sparse_gemm_icsr_sve_gather(
 #if defined(__ARM_FEATURE_SVE)
   const int64_t vl = svcntw();
   const uint32_t N_u32 = (uint32_t)N;
-  
-    int64_t n_block_sz = N/16;
-    const int64_t n_full = (N / n_block_sz) * n_block_sz;
-    const int64_t rem = N - n_full;
 
-    #pragma omp parallel
-    {
-      #pragma omp for collapse(2) schedule(static)
-      for (int64_t m = 0; m < M; ++m) {
-        for (int64_t n = 0; n < n_full; n += n_block_sz) {
-          const int64_t nnz = offsets_ptr[m + 1] - offsets_ptr[m];
-          if (nnz == 0) continue;
+  const int64_t block_sz = std::max<int64_t>(1, N / 16);
+  const int64_t n_block = (N + block_sz - 1) / block_sz;
 
-          const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + offsets_ptr[m];
-          float* out_row_ptr = out_ptr + m * N;
-          std::vector<float> acc(n_block_sz, 0.0f);
+  #pragma omp parallel
+  {
+    std::vector<float> acc_buf;
+    acc_buf.resize((size_t)block_sz);
 
-          for (int64_t i = 0; i < nnz; i += vl) {
-            const svbool_t pg = svwhilelt_b32(i, nnz);
-            const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
+    #pragma omp for schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t nb = 0; nb < n_block; ++nb) {
+        const int64_t n0 = nb * block_sz;
+        const int64_t n_valid = std::min<int64_t>(block_sz, N - n0);
+        float* acc = acc_buf.data();
 
-            // gather load act nonzeros
-            const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
+        const int64_t p0 = offsets_ptr[m];
+        const int64_t p1 = offsets_ptr[m + 1];
+        const int64_t nnz = p1 - p0;
 
-            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
+        std::fill_n(acc, (size_t)n_valid, 0.0f);
 
-            const float* base = weight_ptr + n;
+        if (nnz > 0) {
+        const float* act_row_ptr = act_ptr + m * K;
+        const uint32_t* idx_ptr = indices_ptr + p0;
+        const float* base = weight_ptr + n0;
 
-            for(int64_t r = 0; r < n_block_sz; r++) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
-              acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
-            }
+        for (int64_t i = 0; i < nnz; i += vl) {
+          const svbool_t pg = svwhilelt_b32(i, nnz);
+          const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
+          const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
+          const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
+
+          for (int64_t r = 0; r < n_valid; ++r) {
+            const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
+            acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
           }
+        }
+        }
 
-          for(int64_t r = 0; r < n_block_sz; r++) {
-            out_row_ptr[n + r] += acc[r];
-          }
-        } 
-      } 
-
-      if (rem > 0) {
-        #pragma omp for schedule(static)
-        for (int64_t m = 0; m < M; ++m) {
-          const int64_t nnz = offsets_ptr[m + 1] - offsets_ptr[m];
-          if (nnz == 0) continue;
-
-          const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + offsets_ptr[m];
-          float* out_row_ptr = out_ptr + m * N;
-
-          const int64_t n_start = n_full;
-          
-          std::vector<float> acc(rem, 0.0f);
-
-          for (int64_t i = 0; i < nnz; i += vl) {
-            const svbool_t pg = svwhilelt_b32(i, nnz);
-            const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
-            const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
-            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
-
-            for (int64_t r = 0; r < rem; ++r) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, weight_ptr + (n_start + r), w_index);
-              acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
-            }
-          }
-
-          for (int64_t r = 0; r < rem; ++r) {
-            out_row_ptr[n_start + r] += acc[r];
-          }
+        float* out_tile = out_ptr + m * N + n0;
+        for (int64_t r = 0; r < n_valid; ++r) out_tile[r] = acc[r];
+      }
+    }
+  }
+#else
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t n = 0; n < N; ++n) {
+        out_ptr[m * N + n] = 0.0f;
+        for (int64_t i = 0; i < nnz; ++i) {
+          const uint32_t k = indices_ptr[i];
+          const float a = act_ptr[m * K + k];
+          if (a == 0.0f) continue;
+          const float* w_row = weight_ptr + k * N;
+          out_ptr[m * N + n] += a * w_row[n];
         }
       }
     }
 #endif
-
   return output;
 }
 

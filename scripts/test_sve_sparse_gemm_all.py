@@ -333,12 +333,10 @@ def test_core_gemm_only(
     )
     coo_sve_gather_op = coo_sve_gather_kernel.operator(compiled=True)
 
-    # sparse_gemm_coo 需要 int64 col_indices
-    coo_col_indices_i64 = coo_col_indices.to(torch.int64)
-
+    # sparse_gemm_coo 需要 uint32 col_indices，thr_sparsify_to_coo 已返回 uint32
     print("  - sparse_gemm_coo")
     def coo_gemm_only():
-        return coo_op(weight, coo_row_indices, coo_col_indices_i64, coo_values, M)
+        return coo_op(weight, coo_row_indices, coo_col_indices, coo_values, M)
 
     lat = measure_latency(coo_gemm_only, warmup=5, iters=100000)
     results["GEMM-only: COO sparse_gemm_coo (cached triplets)"] = (coo_gemm_only(), lat)
@@ -694,9 +692,8 @@ def test_coo_combinations(
     print("\n[COO-1] thr_sparsify_to_coo + sparse_gemm_coo")
     def coo_combo1():
         row_indices, col_indices, values = thr_sparsify_to_coo(activation, threshold)
-        # sparse_gemm_coo 需要 int64 的 col_indices，thr_sparsify_to_coo 返回 uint32
-        col_indices_i64 = col_indices.to(torch.int64)
-        return coo_op(weight, row_indices, col_indices_i64, values, M)
+        # sparse_gemm_coo 需要 uint32 的 col_indices，thr_sparsify_to_coo 已返回 uint32
+        return coo_op(weight, row_indices, col_indices, values, M)
     
     lat1 = measure_latency(coo_combo1, warmup=5, iters=100000)
     result1 = coo_combo1()
@@ -707,9 +704,8 @@ def test_coo_combinations(
     print("\n[COO-2] thr_sparsify_to_coo_sve + sparse_gemm_coo")
     def coo_combo2():
         row_indices, col_indices, values = thr_sparsify_to_coo_sve(activation, threshold)
-        # sparse_gemm_coo 需要 int64 的 col_indices，thr_sparsify_to_coo_sve 返回 uint32
-        col_indices_i64 = col_indices.to(torch.int64)
-        return coo_op(weight, row_indices, col_indices_i64, values, M)
+        # sparse_gemm_coo 需要 uint32 的 col_indices，thr_sparsify_to_coo_sve 已返回 uint32
+        return coo_op(weight, row_indices, col_indices, values, M)
     
     lat2 = measure_latency(coo_combo2, warmup=5, iters=100000)
     result2 = coo_combo2()
@@ -1004,9 +1000,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--threshold", type=float, default=0.9, help="稀疏化阈值")
-    parser.add_argument("--M", type=int, default=128, help="activation 行数")
-    parser.add_argument("--K", type=int, default=4096, help="activation 列数 / weight 行数")
-    parser.add_argument("--N", type=int, default=4096, help="weight 列数")
+    parser.add_argument("--M", type=int, default=1, help="activation 行数")
+    parser.add_argument("--K", type=int, default=64, help="activation 列数 / weight 行数")
+    parser.add_argument("--N", type=int, default=64, help="weight 列数")
     parser.add_argument(
         "--tests",
         nargs="+",

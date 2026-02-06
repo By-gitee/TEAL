@@ -10,29 +10,18 @@
 #endif
 
 /**
- * 新算子：将稀疏输入组织为 CSR，然后使用类似 sve_sparse_gemm 的计算方式
+ * CSR × dense weight with SVE gather optimization
  *
- * 输入 CSR 格式：
- *   - weight: (K, N) float32, contiguous, CPU
- *   - row_offsets: 1D int64, length = M+1, CSR格式的row_ptr（前缀和）
- *   - nz_col_indices: 1D uint32/int32, flattened col indices for all non-zeros
- *   - values: 1D float32, CSR格式的非零元素值
+ * Input:
+ *   - weight: (K, N) float32 contiguous CPU
+ *   - row_offsets: 1D int64 length=M+1 (CSR row pointers)
+ *   - nz_col_indices: 1D uint32 length=nnz (CSR column indices)
+ *   - values: 1D float32 length=nnz (CSR non-zero values)
  *
- * 功能目标：
- *   1) 直接使用输入的 CSR 格式 (values, col_idx, row_ptr)
- *   2) 使用 CSR 格式与 weight 做乘法，计算方式参考 sve_sparse_gemm：
- *      - 从 CSR values 中连续 load 数据（SIMD）
- *      - 根据 CSR col_idx 计算 weight 中需要参与计算的元素索引位置
- *      - 使用 gather load 加载 weight 到寄存器中参与计算
- *   3) 分块和计算逻辑参考 sve_sparse_gemm_op.cpp (190-325)
- *
- * 与 sve_sparse_gemm 的区别：
- *   - 直接接收 CSR 格式的 values，计算时从 CSR values 连续 load
- *   - 而不是直接从原始 activation 矩阵 gather load
- *
- * 备注：
- * - 本文件刻意不包含 `PYBIND11_MODULE`，方便后续与现有扩展多源编译链接（避免重复定义）。
- * - 当前 SIMD 路径沿用仓库现状：仅在 `svcntw()==4` 时启用 SVE 快路径。
+ * Computation:
+ *   For each row i and its non-zeros (k, a):
+ *     out[i, :] += a * weight[k, :]
+ *   Optimized with SVE gather load for weight matrix access
  */
 
 namespace {
@@ -99,101 +88,57 @@ torch::Tensor sparse_gemm_csr_sve_gather(
   const float* values_ptr = values.data_ptr<float>();
   float* out_ptr = output.data_ptr<float>();
 
-  // 直接使用传入的CSR数据指针进行计算，不进行复制
 #if defined(__ARM_FEATURE_SVE)
   const int64_t vl = svcntw();
   const uint32_t N_u32 = (uint32_t)N;
 
-    int64_t n_block_sz = N / 16;
-    const int64_t n_full = (N / n_block_sz) * n_block_sz;
-    const int64_t rem = N - n_full;
+  const int64_t block_sz = std::max<int64_t>(1, N / 16);
+  const int64_t n_block = (N + block_sz - 1) / block_sz;
 
-    #pragma omp parallel
-    {
-      // Full blocks: parallelize over rows and N-blocks
-      #pragma omp for collapse(2) schedule(static)
-      for (int64_t m = 0; m < M; ++m) {
-        for (int64_t n = 0; n < n_full; n += n_block_sz) {
-          const int64_t p0 = row_offsets_ptr[m];
-          const int64_t p1 = row_offsets_ptr[m + 1];
-          const int64_t nnz = p1 - p0;
-          
-          if (nnz == 0) continue;
+  #pragma omp parallel
+  {
+    std::vector<float> acc_buf;
+    acc_buf.resize((size_t)block_sz);
 
-          // CSR data pointers for this row
-          const float* csr_values_ptr = values_ptr + p0;
-          const uint32_t* csr_col_idx_ptr = indices_ptr + p0;
-          float* out_row_ptr = out_ptr + m * N;
-          
-          std::vector<float> acc(n_block_sz, 0.0f);
-          const float* base = weight_ptr + n;
+    #pragma omp for schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t nb = 0; nb < n_block; ++nb) {
+        const int64_t n0 = nb * block_sz;
+        const int64_t n_valid = std::min<int64_t>(block_sz, N - n0);
+        float* acc = acc_buf.data();
 
-          // Process non-zeros in chunks of 4 (SVE vector length)
-          for (int64_t i = 0; i < nnz; i += vl) {
-            const svbool_t pg = svwhilelt_b32(i, nnz);
-            
-            // Continuous load from CSR values (instead of gather from activation)
-            const svfloat32_t act_vals = svld1_f32(pg, csr_values_ptr + i);
-            
-            // Load column indices and compute weight indices
-            const svuint32_t idx = svld1_u32(pg, csr_col_idx_ptr + i);
-            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
+        const int64_t p0 = row_offsets_ptr[m];
+        const int64_t p1 = row_offsets_ptr[m + 1];
+        const int64_t nnz = p1 - p0;
 
-            // Gather load weight and accumulate for each element in the block
-            for (int64_t r = 0; r < n_block_sz; r++) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
-              acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
-            }
-          }
+        std::fill_n(acc, (size_t)n_valid, 0.0f);
 
-          // Write accumulated results
-          for (int64_t r = 0; r < n_block_sz; r++) {
-            out_row_ptr[n + r] += acc[r];
+        if (nnz > 0) {
+        const float* csr_values_ptr = values_ptr + p0;
+        const uint32_t* csr_col_idx_ptr = indices_ptr + p0;
+        const float* base = weight_ptr + n0;
+
+        for (int64_t i = 0; i < nnz; i += vl) {
+          const svbool_t pg = svwhilelt_b32(i, nnz);
+          const svfloat32_t act_vals = svld1_f32(pg, csr_values_ptr + i);
+          const svuint32_t idx = svld1_u32(pg, csr_col_idx_ptr + i);
+          const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
+
+          for (int64_t r = 0; r < n_valid; ++r) {
+            const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
+            acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
           }
         }
-      }
-
-      // Handle remainder
-      if (rem > 0) {
-        #pragma omp for schedule(static)
-        for (int64_t m = 0; m < M; ++m) {
-          const int64_t p0 = row_offsets_ptr[m];
-          const int64_t p1 = row_offsets_ptr[m + 1];
-          const int64_t nnz = p1 - p0;
-          
-          if (nnz == 0) continue;
-
-          const float* csr_values_ptr = values_ptr + p0;
-          const uint32_t* csr_col_idx_ptr = indices_ptr + p0;
-          float* out_row_ptr = out_ptr + m * N;
-          const int64_t n_start = n_full;
-          
-          std::vector<float> acc(rem, 0.0f);
-
-          for (int64_t i = 0; i < nnz; i += vl) {
-            const svbool_t pg = svwhilelt_b32(i, nnz);
-            
-            // Continuous load from CSR values
-            const svfloat32_t act_vals = svld1_f32(pg, csr_values_ptr + i);
-            
-            // Load column indices and compute weight indices
-            const svuint32_t idx = svld1_u32(pg, csr_col_idx_ptr + i);
-            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
-
-            for (int64_t r = 0; r < rem; ++r) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, weight_ptr + (n_start + r), w_index);
-              acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
-            }
-          }
-
-          for (int64_t r = 0; r < rem; ++r) {
-            out_row_ptr[n_start + r] += acc[r];
-          }
         }
+
+        float* out_tile = out_ptr + m * N + n0;
+        for (int64_t r = 0; r < n_valid; ++r) out_tile[r] = acc[r];
       }
+    }
   }
 #else
   // Scalar fallback path
+  #pragma omp parallel for
   for (int64_t m = 0; m < M; ++m) {
     const int64_t p0 = row_offsets_ptr[m];
     const int64_t p1 = row_offsets_ptr[m + 1];
@@ -212,7 +157,7 @@ torch::Tensor sparse_gemm_csr_sve_gather(
   return output;
 }
 
-// 注册到 torch.ops.sparse_op
+// Register to torch.ops.sparse_op
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("sparse_gemm_csr_sve_gather(Tensor weight, Tensor row_offsets, Tensor nz_col_indices, Tensor values) -> Tensor");
 }

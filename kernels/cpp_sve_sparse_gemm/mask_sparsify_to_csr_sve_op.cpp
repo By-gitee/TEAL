@@ -98,7 +98,7 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_csr_sve(const Tensor&
         svuint8_t v = svld1_u8(pg, mask_row + k);
         svbool_t keep = svcmpne_n_u8(pg, v, 0);
         nnz += (int64_t)svcntp_b8(pg, keep);
-        k += svcntb();
+        k += vl_u8;
       }
 #else
       // Scalar fallback

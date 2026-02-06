@@ -63,13 +63,12 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
   }
 
   // ---------------- row_offsets prefix sum (M+1) ----------------
-  Tensor row_offsets = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* offsets = row_offsets.data_ptr<int64_t>();
-  offsets[0] = 0;
+  std::vector<int64_t> row_offsets(M + 1);
+  row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
-    offsets[m + 1] = offsets[m] + counts[m];
+    row_offsets[m + 1] = row_offsets[m] + counts[m];
   }
-  const int64_t total_nnz = offsets[M];
+  const int64_t total_nnz = row_offsets[M];
 
   // ---------------- Allocate CSR arrays: nz_col_indices + values ----------------
   Tensor nz_col_indices = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
@@ -88,8 +87,8 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
     if (nnz == 0) continue;
 
     const float* row = act_ptr + m * K;
-    uint32_t* __restrict dst_idx = out_idx + offsets[m];
-    float* __restrict dst_val = out_val + offsets[m];
+    uint32_t* __restrict dst_idx = out_idx + row_offsets[m];
+    float* __restrict dst_val = out_val + row_offsets[m];
     int64_t write_pos = 0;
 
     // Full-keep fast path
@@ -171,7 +170,10 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
 #endif
   }
 
-  return {row_offsets, nz_col_indices, values};
+  // 将 row_offsets 转为 Tensor 再返回
+  Tensor row_offsets_t = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
+  return {row_offsets_t, nz_col_indices, values};
 }
 
 // 注册到 PyTorch

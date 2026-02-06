@@ -151,7 +151,6 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
           svbool_t pg1 = svwhilelt_b32((uint32_t)k, (uint32_t)K);
           // 从 uint8 mask 加载并转换判断
           svbool_t pg1_u8 = svwhilelt_b8((uint64_t)k, (uint64_t)K);
-          svuint8_t vmask1 = svld1_u8(pg1_u8, row + k);
           // 将 uint8 扩展为 uint32 以便比较
           svuint32_t vmask1_u32 = svld1ub_u32(pg1, row + k);
           svbool_t keep1 = svcmpne_n_u32(pg1, vmask1_u32, 0);
@@ -209,28 +208,25 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
         }
       }
 #endif
-      // 校验输出数量是否匹配（调试用）
-      if (write_pos != nnz) {
-        // 不匹配时可记录警告
-      }
     }
   }
 
-  // 构建 nz_counts 数组（仅记录有非零值的行及其nnz），形式：[row_index, nnz, row_index2, nnz2, ...]
-  int64_t num_nz_rows = 0;
-  for (int64_t m = 0; m < M; ++m) {
-    if (counts[m] > 0) num_nz_rows++;
-  }
-  Tensor nz_counts = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* nzp = nz_counts.data_ptr<int64_t>();
-  int64_t p = 0;
-  for (int64_t m = 0; m < M; ++m) {
-    int64_t nnz = counts[m];
-    if (nnz > 0) {
-      nzp[p++] = m;
-      nzp[p++] = nnz;
-    }
-  }
+  // // 构建 nz_counts 数组（仅记录有非零值的行及其nnz），形式：[row_index, nnz, row_index2, nnz2, ...]
+  // int64_t num_nz_rows = 0;
+  // for (int64_t m = 0; m < M; ++m) {
+  //   if (counts[m] > 0) num_nz_rows++;
+  // }
+  Tensor nz_counts = torch::empty({2 * M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  // Tensor nz_counts = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  // int64_t* nzp = nz_counts.data_ptr<int64_t>();
+  // int64_t p = 0;
+  // for (int64_t m = 0; m < M; ++m) {
+  //   int64_t nnz = counts[m];
+  //   if (nnz > 0) {
+  //     nzp[p++] = m;
+  //     nzp[p++] = nnz;
+  //   }
+  // }
 
   return std::make_tuple(nz_counts, nz_col_indices, row_offsets);
 }

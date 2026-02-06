@@ -63,34 +63,34 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
 
   // --------------- Build row_offsets (prefix sum) ---------------
   // row_offsets: int64 [M+1]
-  auto row_offsets_t = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* row_offsets = row_offsets_t.data_ptr<int64_t>();
+  std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
     row_offsets[m + 1] = row_offsets[m] + row_nnz[m];
   }
   const int64_t total_nnz = row_offsets[M];
 
-  // --------------- Build nz_counts (sparse pairs [row, nnz]) ---------------
-  // Only rows with nnz>0 are recorded, so nz_counts length is even but not necessarily 2*M.
-  int64_t num_nz_rows = 0;
-  for (int64_t m = 0; m < M; ++m) {
-    if (row_nnz[m] > 0) num_nz_rows++;
-  }
+  // // --------------- Build nz_counts (sparse pairs [row, nnz]) ---------------
+  // // Only rows with nnz>0 are recorded, so nz_counts length is even but not necessarily 2*M.
+  // int64_t num_nz_rows = 0;
+  // for (int64_t m = 0; m < M; ++m) {
+  //   if (row_nnz[m] > 0) num_nz_rows++;
+  // }
 
-  auto nz_counts_t = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* nz_counts = nz_counts_t.data_ptr<int64_t>();
+  // auto nz_counts_t = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  auto nz_counts_t = torch::empty({2 * M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  // int64_t* nz_counts = nz_counts_t.data_ptr<int64_t>();
 
-  {
-    int64_t w = 0;
-    for (int64_t m = 0; m < M; ++m) {
-      const int64_t nnz = row_nnz[m];
-      if (nnz > 0) {
-        nz_counts[w++] = m;
-        nz_counts[w++] = nnz;
-      }
-    }
-  }
+  // {
+  //   int64_t w = 0;
+  //   for (int64_t m = 0; m < M; ++m) {
+  //     const int64_t nnz = row_nnz[m];
+  //     if (nnz > 0) {
+  //       nz_counts[w++] = m;
+  //       nz_counts[w++] = nnz;
+  //     }
+  //   }
+  // }
 
   // --------------- Allocate nz_col_indices (flattened) ---------------
   auto nz_col_indices_t = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
@@ -178,6 +178,9 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
 #endif
   }
 
+  // 将 row_offsets 转为 Tensor 再返回
+  torch::Tensor row_offsets_t = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
   return {nz_counts_t, nz_col_indices_t, row_offsets_t};
 }
 

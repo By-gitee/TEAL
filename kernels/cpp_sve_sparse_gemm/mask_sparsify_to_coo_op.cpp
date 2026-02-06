@@ -9,6 +9,10 @@
 #include <omp.h>
 #endif
 
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
+
 using torch::Tensor;
 
 static inline void check_mask_sparsify_to_coo_inputs(const Tensor& activation, const Tensor& mask) {

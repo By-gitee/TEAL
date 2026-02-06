@@ -12,15 +12,15 @@
 /**
  * COO × dense weight
  *
- * 输入：
+ * Input:
  *   - weight: (K, N) float32 contiguous CPU
  *   - row_indices: 1D int64 length=nnz (sorted by row)
- *   - col_indices: 1D int64 length=nnz
+ *   - col_indices: 1D uint32 length=nnz
  *   - values:      1D float32 length=nnz
  *   - M, K, N: matmul shape info for sparse(M,K) x weight(K,N) -> out(M,N)
  *
- * 计算：
- *   对于每个非零 (i, k, a):
+ * Computation:
+ *   For each non-zero (i, k, a):
  *     out[i, :] += a * weight[k, :]
  */
 
@@ -41,7 +41,7 @@ static inline void check_inputs_coo_gemm(
 
   TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
   TORCH_CHECK(row_indices.dtype() == torch::kInt64, "row_indices must be int64");
-  TORCH_CHECK(col_indices.dtype() == torch::kInt64, "col_indices must be int64");
+  TORCH_CHECK(col_indices.dtype() == torch::kUInt32, "col_indices must be uint32");
   TORCH_CHECK(values.dtype() == torch::kFloat32, "values must be float32");
 
   TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
@@ -61,21 +61,6 @@ static inline void check_inputs_coo_gemm(
   TORCH_CHECK(M >= 0 && K >= 0 && N >= 0, "M,K,N must be non-negative");
   TORCH_CHECK(weight.size(0) == K, "weight.size(0) must equal K");
   TORCH_CHECK(weight.size(1) == N, "weight.size(1) must equal N");
-
-  // nnz==0 时无需检查索引范围（避免访问空指针）
-  if (nnz > 0) {
-    const int64_t* rptr = row_indices.data_ptr<int64_t>();
-    const int64_t* cptr = col_indices.data_ptr<int64_t>();
-
-    // row 已按行排序：检查首尾即可保证 0 <= row < M
-    TORCH_CHECK(rptr[0] >= 0, "row_indices has negative value");
-    TORCH_CHECK(rptr[nnz - 1] < M, "row_indices out of range: expect < M");
-
-    // col 不保证排序：min/max 扫描一次
-    auto [cmin_it, cmax_it] = std::minmax_element(cptr, cptr + nnz);
-    TORCH_CHECK(*cmin_it >= 0, "col_indices has negative value");
-    TORCH_CHECK(*cmax_it < K, "col_indices out of range: expect < K");
-  }
 }
 
 } // namespace
@@ -99,41 +84,42 @@ torch::Tensor sparse_gemm_coo(
 
   const float* weight_ptr = weight.data_ptr<float>();
   const int64_t* row_indices_ptr = row_indices.data_ptr<int64_t>();
-  const int64_t* col_indices_ptr = col_indices.data_ptr<int64_t>();
+  const uint32_t* col_indices_ptr = col_indices.data_ptr<uint32_t>();
   const float* values_ptr = values.data_ptr<float>();
   float* out_ptr = output.data_ptr<float>();
 
-  // row_indices 已按行排序：用计数 + 前缀和得到每行 [p0, p1)
+  // row_indices is sorted by row: use counting + prefix sum to get [p0, p1) for each row
   std::vector<int64_t> row_starts(M + 1, 0);
   for (int64_t i = 0; i < nnz; ++i) {
     const int64_t row = row_indices_ptr[i];
     row_starts[row + 1]++;
   }
+  // Accumulate prefix sum to get the starting position of each row
   for (int64_t i = 0; i < M; ++i) {
     row_starts[i + 1] += row_starts[i];
   }
 
-  // N 分块（保持你原先的 L1-friendly 设计）
-  const int64_t BN = N/16;
-  const int64_t NB = (N + BN - 1) / BN;
+  // N-dimension blocking (L1-friendly design)
+  const int64_t n_block_sz = N/16;
+  const int64_t n_block = (N + n_block_sz - 1) / n_block_sz;
 
-  #pragma omp parallel for collapse(2) schedule(dynamic)
+  #pragma omp parallel for collapse(2) schedule(static)
   for (int64_t m = 0; m < M; ++m) {
-    for (int64_t nb = 0; nb < NB; ++nb) {
+    for (int64_t nb = 0; nb < n_block; ++nb) {
       const int64_t p0 = row_starts[m];
       const int64_t p1 = row_starts[m + 1];
       if (p0 == p1) continue;
 
-      const int64_t n0 = nb * BN;
-      const int64_t n1 = std::min<int64_t>(n0 + BN, N);
+      const int64_t n0 = nb * n_block_sz;
+      const int64_t n1 = std::min<int64_t>(n0 + n_block_sz, N);
 
       float* out_row = out_ptr + m * N;
 
 #if defined(__ARM_FEATURE_SVE)
       for (int64_t p = p0; p < p1; ++p) {
-        const int64_t k = col_indices_ptr[p];
+        const uint32_t k = col_indices_ptr[p];
         const float a = values_ptr[p];
-        const float* w_row = weight_ptr + k * N;
+        const float* w_row = weight_ptr + (int64_t)k * N;
 
         int64_t n = n0;
         for (; n < n1; ) {
@@ -161,7 +147,7 @@ torch::Tensor sparse_gemm_coo(
   return output;
 }
 
-// 注册到 torch.ops.sparse_op
+// Register to torch.ops.sparse_op
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("sparse_gemm_coo(Tensor weight, Tensor row_indices, Tensor col_indices, Tensor values, int M, int K, int N) -> Tensor");
 }

@@ -383,7 +383,7 @@ class SparseGEMMCOOKernel(BaseKernel):
     Args:
         weight: (K, N) 稠密权重矩阵（float32, contiguous, CPU）
         row_indices: 1D int64, length = nnz, COO格式的行索引（已按行排序）
-        col_indices: 1D int64/uint32 等整型均可；C++ 侧要求 int64，本 wrapper 会转换为 int64 contiguous
+        col_indices: 1D uint32, length = nnz, COO格式的列索引（C++ 侧要求 uint32）
         values: 1D float32, length = nnz, COO格式的非零元素值（与row_indices对应）
         M: 稀疏矩阵的行数（通常等于生成这些 COO 数据的 activation.size(0)）
     
@@ -413,9 +413,9 @@ class SparseGEMMCOOKernel(BaseKernel):
         load_sve_sparse_gemm_extension()
         K = int(weight.size(0))
         N = int(weight.size(1))
-        # C++ 侧要求 col_indices=int64；thr_sparsify_to_coo 返回的是 uint32，这里统一转换
-        if col_indices.dtype != torch.int64:
-            col_indices = col_indices.to(torch.int64)
+        # C++ 侧要求 col_indices=uint32；thr_sparsify_to_coo 返回的就是 uint32
+        if col_indices.dtype != torch.uint32:
+            col_indices = col_indices.to(torch.uint32)
         if not col_indices.is_contiguous():
             col_indices = col_indices.contiguous()
         return torch.ops.sparse_op.sparse_gemm_coo(

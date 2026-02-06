@@ -10,23 +10,17 @@
 #endif
 
 /**
- * 新算子：直接使用CSR格式输入，然后做 CSR × dense weight
+ * CSR × dense weight
  *
- * 输入 CSR 格式：
- *   - weight: (K, N) float32, contiguous, CPU
- *   - row_offsets: 1D int64, length = M + 1, CSR格式的row_ptr（前缀和）
- *   - nz_col_indices: 1D uint32/int32, flattened col indices for all non-zeros
- *   - values: 1D float32, CSR格式的非零元素值
+ * Input:
+ *   - weight: (K, N) float32 contiguous CPU
+ *   - row_offsets: 1D int64 length=M+1 (CSR row pointers)
+ *   - nz_col_indices: 1D uint32 length=nnz (CSR column indices)
+ *   - values: 1D float32 length=nnz (CSR non-zero values)
  *
- * 功能目标：
- *   1) 直接使用输入的 CSR 格式 (values, col_idx, row_ptr)
- *   2) 使用 CSR 与 weight 做乘法输出 (M, N)
- *   3) 计算过程中使用 SIMD（SVE）加速
- *   4) 在 activation 行间（M 维）并行加速（OpenMP）
- *
- * 备注：
- * - 本文件刻意不包含 `PYBIND11_MODULE`，方便后续与现有扩展多源编译链接（避免重复定义）。
- * - 当前 SIMD 路径沿用仓库现状：仅在 `svcntw()==4` 时启用 SVE 快路径。
+ * Computation:
+ *   For each row i and its non-zeros (k, a):
+ *     out[i, :] += a * weight[k, :]
  */
 
 namespace {
@@ -43,9 +37,7 @@ void check_inputs_csr_gemm(
 
   TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
   TORCH_CHECK(row_offsets.dtype() == torch::kInt64, "row_offsets must be int64");
-  TORCH_CHECK(
-      nz_col_indices.dtype() == torch::kUInt32 || nz_col_indices.dtype() == torch::kInt32,
-      "nz_col_indices must be uint32 or int32");
+  TORCH_CHECK(nz_col_indices.dtype() == torch::kUInt32, "nz_col_indices must be uint32");
   TORCH_CHECK(values.dtype() == torch::kFloat32, "values must be float32");
 
   TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
@@ -96,28 +88,26 @@ torch::Tensor sparse_gemm_csr(
   float* out_ptr = output.data_ptr<float>();
 
   // CSR × dense weight -> dense output
-  // 直接使用输入的CSR数据指针，不需要构建CSR结构
-  // 选一个 N 分块大小：建议是 L1-friendly 且是 16 的倍数（方便向量化）
-  // 经验：256/384/512 都常用。你可以按平台调参。
-  const int64_t BN = N/16;
+  // N-dimension blocking (L1-friendly design)
+  const int64_t n_block_sz = N/16;
 
-  const int64_t NB = (N + BN - 1) / BN;
+  const int64_t n_block = (N + n_block_sz - 1) / n_block_sz;
 
-  // 二维并行：每个线程负责一个 (m, nb) tile，写 out_row[n0:n1) 无冲突
+  // 2D parallelization: each thread handles one (m, nb) tile
   #pragma omp parallel for collapse(2) schedule(static)
   for (int64_t m = 0; m < M; ++m) {
-    for (int64_t nb = 0; nb < NB; ++nb) {
+    for (int64_t nb = 0; nb < n_block; ++nb) {
       const int64_t p0 = row_offsets_ptr[m];
       const int64_t p1 = row_offsets_ptr[m + 1];
       if (p0 == p1) continue;
 
-      const int64_t n0 = nb * BN;
-      const int64_t n1 = std::min<int64_t>(n0 + BN, N);
+      const int64_t n0 = nb * n_block_sz;
+      const int64_t n1 = std::min<int64_t>(n0 + n_block_sz, N);
 
       float* out_row = out_ptr + m * N;
 
 #if defined(__ARM_FEATURE_SVE)
-      // SVE 路径：对 [n0, n1) 做向量累加，尾部用谓词处理
+      // SVE path: vectorized accumulation for [n0, n1) with predicate for tail
       for (int64_t p = p0; p < p1; ++p) {
         const uint32_t k = indices_ptr[p];
         const float a = values_ptr[p];
@@ -125,20 +115,20 @@ torch::Tensor sparse_gemm_csr(
 
         int64_t n = n0;
         for (; n < n1; ) {
-          // 以 32-bit lane 计数的谓词：覆盖 [n, n1)
+          // Predicate for 32-bit lanes covering [n, n1)
           svbool_t pg = svwhilelt_b32(n, n1);
 
-          // load out / weight，做 FMA，然后 store 回 out
+          // Load output/weight, perform FMA, then store back to output
           svfloat32_t ov = svld1_f32(pg, out_row + n);
           svfloat32_t wv = svld1_f32(pg, w_row  + n);
           svfloat32_t rv = svmla_n_f32_m(pg, ov, wv, a);
           svst1_f32(pg, out_row + n, rv);
 
-          n += svcntw(); // 前进一个 VL（以 float32 lane 数）
+          n += svcntw(); // Advance by one vector length (in float32 lanes)
         }
       }
 #else
-      // 标量路径：只更新该 N tile
+      // Scalar path: update only this N tile
       for (int64_t p = p0; p < p1; ++p) {
         const uint32_t k = indices_ptr[p];
         const float a = values_ptr[p];
@@ -154,7 +144,7 @@ torch::Tensor sparse_gemm_csr(
   return output;
 }
 
-// 注册到 torch.ops.sparse_op
+// Register to torch.ops.sparse_op
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("sparse_gemm_csr(Tensor weight, Tensor row_offsets, Tensor nz_col_indices, Tensor values) -> Tensor");
 }

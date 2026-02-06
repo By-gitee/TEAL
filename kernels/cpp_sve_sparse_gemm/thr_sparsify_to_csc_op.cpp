@@ -56,7 +56,8 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
 #ifdef _OPENMP
     tid = omp_get_thread_num();
 #endif
-    uint32_t* my_counts = local_counts.data() + (size_t)tid * (size_t)K;
+    
+  uint32_t* my_counts = local_counts.data() + (size_t)tid * (size_t)K;
 
 #if defined(__ARM_FEATURE_SVE)
     const svuint32_t vone = svdup_u32(1);

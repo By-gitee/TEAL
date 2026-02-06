@@ -15,10 +15,20 @@
 #endif
 
 /**
- * CSC sparse GEMM:  Out(M,N) = A_csc(M,K) * W(K,N)
- * A in CSC: col_ptr (K+1), row_indices (uint32), values (float)
+ * CSC × dense weight
  *
- * Parallel strategy (方案A):
+ * Input:
+ *   - weight: (K, N) float32 contiguous CPU
+ *   - col_ptr: 1D int64 length=K+1 (CSC column pointer)
+ *   - row_indices: 1D uint32 length=nnz (row indices in CSC format)
+ *   - values: 1D float32 length=nnz (non-zero values in CSC format)
+ *   - M: output matrix row count
+ *
+ * Computation:
+ *   For each column k and its non-zero (m, a):
+ *     out[m, :] += a * weight[k, :]
+ *
+ * Parallel strategy (Scheme A):
  *   - Parallelize over K blocks (each thread owns a disjoint k-range)
  *   - Each thread accumulates into a private output buffer (M*N)
  *   - Reduce private buffers into final output
@@ -40,7 +50,7 @@ static inline void check_sparse_gemm_csc_inputs(
 
   TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
   TORCH_CHECK(col_ptr.dtype() == torch::kInt64, "col_ptr must be int64");
-  // 为避免错读，这里强制 uint32（你原代码允许 int32 但后面按 uint32 读，会出错）
+  // To avoid misreading, enforce uint32 here (allowing int32 but reading as uint32 would cause errors)
   TORCH_CHECK(row_indices.dtype() == torch::kUInt32, "row_indices must be uint32");
   TORCH_CHECK(values.dtype() == torch::kFloat32, "values must be float32");
 
@@ -67,7 +77,7 @@ static inline void check_sparse_gemm_csc_inputs(
   TORCH_CHECK(nnz == values.size(0), "values length must equal col_ptr[K] (nnz)");
 }
 
-// 每线程计算：处理 k in [k0, k1)，把贡献累加到 out_private (M*N)
+// Per-thread computation: process k in [k0, k1), accumulate contribution into out_private (M*N)
 static inline void compute_k_range_private_out(
     const float* values_ptr,
     const uint32_t* row_indices_ptr,
@@ -95,8 +105,6 @@ static inline void compute_k_range_private_out(
 
     for (int64_t idx = col_start; idx < col_end; ++idx) {
       const int64_t m = (int64_t)row_indices_ptr[idx];
-      // 可选：如果你担心 row_indices 越界，可以加个 debug check（release 下建议去掉）
-      // if ((uint64_t)m >= (uint64_t)M) continue;
 
       const float a_val = values_ptr[idx];
       float* out_row = out_private + m * N;
@@ -155,9 +163,9 @@ torch::Tensor sparse_gemm_csc(
 #endif
   if (nthreads < 1) nthreads = 1;
 
-  // --- 方案A：每线程私有输出 ---
-  // 注意：内存开销 = nthreads * M * N * 4 bytes
-  // M <= 256 时通常还能接受；若 N 很大、线程很多，建议改成 (M*N_tile) 缓冲版。
+  // --- Scheme A: per-thread private output ---
+  // Note: memory overhead = nthreads * M * N * 4 bytes
+  // Acceptable when M <= 256; if N is large and many threads, consider using (M*N_tile) buffer version.
   std::vector<std::vector<float>> priv((size_t)nthreads);
 
 #ifdef _OPENMP
@@ -168,11 +176,11 @@ torch::Tensor sparse_gemm_csc(
 #ifdef _OPENMP
     tid = omp_get_thread_num();
 #endif
-    // 线程私有缓冲清零
+    // Zero-initialize thread-private buffer
     priv[(size_t)tid].assign((size_t)M * (size_t)N, 0.0f);
     float* out_private = priv[(size_t)tid].data();
 
-    // 静态按 K 切块：线程 tid 负责 [k0,k1)
+    // Static K-block partitioning: thread tid is responsible for [k0, k1)
     const int64_t k0 = (K * (int64_t)tid) / nthreads;
     const int64_t k1 = (K * (int64_t)(tid + 1)) / nthreads;
 
@@ -180,7 +188,7 @@ torch::Tensor sparse_gemm_csc(
                                 weight_ptr, out_private, M, K, N, k0, k1);
   }
 
-  // --- 归约：把每个线程的私有输出加到最终 output ---
+  // --- Reduction: accumulate each thread's private output into final output ---
   const int64_t MN = M * N;
 
 #ifdef _OPENMP
@@ -197,7 +205,7 @@ torch::Tensor sparse_gemm_csc(
   return output;
 }
 
-// 注册到 PyTorch
+// Register to PyTorch
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("sparse_gemm_csc(Tensor weight, Tensor col_ptr, Tensor row_indices, Tensor values, int M, int ncore=0) -> Tensor");
 }
