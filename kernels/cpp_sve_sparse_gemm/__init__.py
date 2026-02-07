@@ -1,9 +1,3 @@
-"""
-兼容导入路径：允许通过 `kernels.cpp_sve_sparse_gemm` 导入 Python wrapper。
-
-注意：该目录下的 `.cpp` 文件是 C++ 扩展源码；Python 侧 wrapper 实现在 `kernels.sve_sparse_gemm`。
-"""
-
 from kernels.sve_sparse_gemm import (  # noqa: F401
     # extension loader / utils
     load_sve_sparse_gemm_extension,

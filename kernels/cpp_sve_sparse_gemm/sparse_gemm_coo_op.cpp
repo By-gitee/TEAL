@@ -103,6 +103,7 @@ torch::Tensor sparse_gemm_coo(
   const int64_t n_block_sz = N/16;
   const int64_t n_block = (N + n_block_sz - 1) / n_block_sz;
 
+  // Use local accumulator per tile then single write to reduce rounding error (match SVE gather behavior).
   #pragma omp parallel for collapse(2) schedule(static)
   for (int64_t m = 0; m < M; ++m) {
     for (int64_t nb = 0; nb < n_block; ++nb) {
@@ -112,33 +113,40 @@ torch::Tensor sparse_gemm_coo(
 
       const int64_t n0 = nb * n_block_sz;
       const int64_t n1 = std::min<int64_t>(n0 + n_block_sz, N);
+      const int64_t block_len = n1 - n0;
 
       float* out_row = out_ptr + m * N;
+      std::vector<float> acc(block_len, 0.0f);
 
 #if defined(__ARM_FEATURE_SVE)
       for (int64_t p = p0; p < p1; ++p) {
         const uint32_t k = col_indices_ptr[p];
         const float a = values_ptr[p];
         const float* w_row = weight_ptr + (int64_t)k * N;
-
-        int64_t n = n0;
-        for (; n < n1; ) {
-          svbool_t pg = svwhilelt_b32(n, n1);
-          svfloat32_t ov = svld1_f32(pg, out_row + n);
-          svfloat32_t wv = svld1_f32(pg, w_row  + n);
-          svfloat32_t rv = svmla_n_f32_m(pg, ov, wv, a);
-          svst1_f32(pg, out_row + n, rv);
+        int64_t n = 0;
+        for (; n < block_len; ) {
+          svbool_t pg = svwhilelt_b32(n, block_len);
+          svfloat32_t accv = svld1_f32(pg, acc.data() + n);
+          svfloat32_t wv = svld1_f32(pg, w_row + n0 + n);
+          svfloat32_t rv = svmla_n_f32_m(pg, accv, wv, a);
+          svst1_f32(pg, acc.data() + n, rv);
           n += svcntw();
         }
+      }
+      for (int64_t r = 0; r < block_len; ++r) {
+        out_row[n0 + r] = acc[r];
       }
 #else
       for (int64_t p = p0; p < p1; ++p) {
         const int64_t k = col_indices_ptr[p];
         const float a = values_ptr[p];
         const float* w_row = weight_ptr + k * N;
-        for (int64_t n = n0; n < n1; ++n) {
-          out_row[n] += a * w_row[n];
+        for (int64_t r = 0; r < block_len; ++r) {
+          acc[r] += a * w_row[n0 + r];
         }
+      }
+      for (int64_t r = 0; r < block_len; ++r) {
+        out_row[n0 + r] = acc[r];
       }
 #endif
     }

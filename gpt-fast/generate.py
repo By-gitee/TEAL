@@ -61,9 +61,11 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     return probs
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    probs = logits_to_probs(logits[0, -1], temperature, top_k)
-    idx_next = multinomial_sample_one_no_sync(probs)
-    return idx_next, probs
+    # logits: (B, S, V) 或 (1, S, V)；取每个 batch 的最后一个位置
+    last_logits = logits[:, -1]  # (B, V)
+    probs = logits_to_probs(last_logits, temperature, top_k)
+    idx_next = multinomial_sample_one_no_sync(probs)  # (B, 1)
+    return idx_next.squeeze(-1), probs
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
@@ -170,11 +172,15 @@ def generate(
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+    prompt: (T,) 单序列或 (B, T) 批序列；batch_size>1 时 prefill 按批计算，decode 仅对第一条序列继续生成。
     """
 
     is_speculative = draft_model is not None
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    T = prompt.size(0)
+    # prompt: (T,) 或 (B, T)；batch_size=1 时为单序列
+    if prompt.dim() == 1:
+        prompt = prompt.unsqueeze(0)  # (1, T)
+    batch_size = prompt.size(0)
+    T = prompt.size(1)
     T_new = T + max_new_tokens
     if interactive:
         max_seq_length = 350
@@ -184,28 +190,30 @@ def generate(
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = prompt
-    seq = empty
+    # 当前只对 batch 中第 0 条做完整 decode，其余仅做 prefill
     input_pos = torch.arange(0, T, device=device)
-
-    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
+    next_token = prefill(model, prompt, input_pos, **sampling_kwargs).clone()  # (batch_size,)
     if is_speculative:
-        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq[T] = next_token
+        prefill(draft_model, prompt, input_pos, **sampling_kwargs)
+
+    empty = torch.empty(T_new, dtype=dtype, device=device)
+    empty[:T] = prompt[0]
+    seq = empty
+    seq[T] = next_token[0] if next_token.dim() > 0 else next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
+    # decode 阶段只用第一条序列的 next token
+    cur_next = next_token[0:1] if (next_token.dim() > 0 and next_token.size(0) > 1) else next_token
 
     if is_speculative:
         input_pos = input_pos.item()  # for speculative decoding easier to keep on host
         while input_pos < T_new - 1:
-            cur_token = next_token.view(())
+            cur_token = cur_next.view(())
 
             next_tokens = speculative_decode(
                 model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
@@ -217,9 +225,9 @@ def generate(
             for i in next_tokens[: num_added,]:
                 callback(i)
             input_pos = input_pos + num_added
-            next_token = next_tokens[-1]
+            cur_next = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(model, cur_next.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[T + 1:] = torch.cat(generated_tokens)
 
     generate_stats = {

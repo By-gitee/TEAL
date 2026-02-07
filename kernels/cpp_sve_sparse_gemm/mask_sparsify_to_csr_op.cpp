@@ -172,9 +172,10 @@ mask_sparsify_to_csr(torch::Tensor activation, torch::Tensor mask) {
   return {row_offsets, nz_col_indices, values};
 }
 
-// 注册到 PyTorch
-// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
-// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
+
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("mask_sparsify_to_csr(Tensor activation, Tensor mask) -> (Tensor row_offsets, Tensor nz_col_indices, Tensor values)");
 }

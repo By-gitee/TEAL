@@ -27,7 +27,24 @@ static inline float abs_f32_fast(float x) {
   return v.f;
 }
 
-// thr_sparsify_to_csr(activation, threshold) -> (row_offsets, nz_col_indices, values)
+/**
+ * thr_sparsify_to_csr(activation, threshold) -> (row_offsets, nz_col_indices, values)
+ *
+ * Converts a dense matrix to CSR sparse format based on threshold.
+ *
+ * Args:
+ *   activation: (M, K) float32 dense matrix
+ *   threshold: float threshold, elements with abs(x) >= threshold are kept
+ *
+ * Returns:
+ *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum)
+ *   nz_col_indices: uint32 [nnz] column index array
+ *   values: float32 [nnz] non-zero element value array
+ *
+ * Implementation strategy:
+ *   Pass 1: Count non-zero elements per row
+ *   Pass 2: Write nz_col_indices and values (per-row buffer, batch stores)
+ */
 static std::tuple<Tensor, Tensor, Tensor>
 thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
   check_thr_sparsify_to_csr_inputs(activation);
@@ -170,15 +187,15 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
 #endif
   }
 
-  // 将 row_offsets 转为 Tensor 再返回
+  // Convert row_offsets to Tensor and return
   Tensor row_offsets_t = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
   return {row_offsets_t, nz_col_indices, values};
 }
 
-// 注册到 PyTorch
-// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
-// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("thr_sparsify_to_csr(Tensor activation, float threshold) -> (Tensor row_offsets, Tensor nz_col_indices, Tensor values)");
 }

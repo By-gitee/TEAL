@@ -71,7 +71,7 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
   Tensor counts_t = torch::empty({M}, torch::kInt64);
   int64_t* counts = counts_t.data_ptr<int64_t>();
 
-  // ===================== Pass 1: Count nnz per row =====================
+  // ---------------- Pass 1: Count nnz per row ----------------
 
 #ifdef _OPENMP
 #pragma omp parallel
@@ -132,7 +132,7 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
   }
 }
 
-  // ================= Compute row offsets (prefix sum) =================
+  // ---------------- Compute row offsets (prefix sum) ----------------
   std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
@@ -143,7 +143,7 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
   Tensor nz_col = torch::empty({total}, torch::kUInt32);
   uint32_t* out = (total > 0) ? nz_col.data_ptr<uint32_t>() : nullptr;
 
-  // ===================== Pass 2: Extract indices and pack =====================
+  // ---------------- Pass 2: Extract indices and pack ----------------
 
 #ifdef _OPENMP
 #pragma omp parallel
@@ -182,7 +182,7 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
     }
 
     int64_t k = 0;
-    // 2x loop unrolling for better instruction-level parallelism
+    // Main loop: process 2 vector blocks per iteration for better ILP
     while (k + 2 * vl <= K) {
       // Process first vector block
       svbool_t pg1 = svwhilelt_b32((uint32_t)k, (uint32_t)K);
@@ -251,7 +251,7 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
   }
 }
 
-// ================= nz_counts =================
+// ---------------- nz_counts (placeholder 2*M) ----------------
 
 // int64_t rows = 0;
 // for (int64_t m = 0; m < M; ++m) if (counts[m] > 0) rows++;
@@ -279,14 +279,13 @@ Tensor nz_counts = torch::empty({2 * M}, torch::kInt64);
 //         &thr_sparsify_to_icsr_sve_baseline);
 // }
 
-// Register to PyTorch
+// Register to PyTorch.
 // Note: This file is compiled with other operator sources into the same extension.
 // Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
-    m.def("thr_sparsify_to_icsr_sve_baseline(Tensor activation, float threshold) -> (Tensor, Tensor, Tensor)");
-  }
-  
-  TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
-    m.impl("thr_sparsify_to_icsr_sve_baseline", thr_sparsify_to_icsr_sve_baseline);
-  }
-  
+  m.def("thr_sparsify_to_icsr_sve_baseline(Tensor activation, float threshold) -> (Tensor, Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(sparse_op, CPU, m) {
+  m.impl("thr_sparsify_to_icsr_sve_baseline", thr_sparsify_to_icsr_sve_baseline);
+}

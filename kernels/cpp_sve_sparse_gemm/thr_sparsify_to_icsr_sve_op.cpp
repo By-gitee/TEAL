@@ -21,20 +21,20 @@ static inline void check_inputs(const Tensor& activation) {
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D [M, K]");
 }
 
-/***
+/**
  * thr_sparsify_to_icsr_sve(activation, threshold) -> (nz_counts, nz_col_indices, row_offsets)
- * 
+ *
  * Converts a dense matrix to ICSR sparse format based on threshold (SVE/SVE2 accelerated).
- * 
+ *
  * Args:
  *   activation: (M, K) float32 dense matrix
  *   threshold: float threshold, elements with abs(x) >= threshold are kept
- * 
+ *
  * Returns:
  *   nz_counts: int64 [2*M] non-zero counts array (row indices and nnz pairs)
  *   nz_col_indices: uint32 [nnz] column index array
  *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum)
- * 
+ *
  * Implementation Strategy (SVE optimized with 2x loop unrolling):
  *   Pass 1: Count non-zero elements per row using SVE vectorization
  *     - svabs_f32_x + svcmpge_f32: vectorized threshold comparison
@@ -42,9 +42,8 @@ static inline void check_inputs(const Tensor& activation) {
  *   Pass 2: Compute row offsets (prefix sum) to get CSR row_ptr
  *   Pass 3: Extract and compact CSR data using SVE2 with 2-way unrolling
  *     - Main loop: process 2*vl elements per iteration for better ILP
- *     - svcompact_u32/svcompact_f32: compress sparse data
+ *     - svcompact_u32: compress sparse column indices
  *     - Optimization: skip compact for full-keep chunks
- *     - SVE int64 vector stores for efficient row index filling
  */
 static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor& activation, double threshold) {
   check_inputs(activation);
@@ -54,18 +53,18 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
   const float thr = (float)threshold;
   const float* act = activation.data_ptr<float>();
 
-  // 分配每行非零元素计数数组（int64，便于后续前缀和计算）
+  // Allocate per-row non-zero count array (int64 for prefix sum)
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* counts = counts_t.data_ptr<int64_t>();
 
-  // Pass1：统计每行满足阈值的元素个数
+  // ---------------- Pass 1: Count nnz per row (SVE vectorized) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
   {
 #if defined(__ARM_FEATURE_SVE)
-    const svfloat32_t vthr = svdup_f32(thr);  // 将阈值广播至向量
-    const size_t vl = svcntw();               // 每个向量可处理的float数量（动态VL）
+    const svfloat32_t vthr = svdup_f32(thr);  // Broadcast threshold to vector
+    const size_t vl = svcntw();               // SVE vector length in float elements
 #endif
 
 #ifdef _OPENMP
@@ -77,16 +76,16 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
       
 #if defined(__ARM_FEATURE_SVE)
       int64_t k = 0;
-      // 向量循环展开2倍处理
+      // Main loop: process 2 vector blocks per iteration
       while (k + 2 * (int64_t)vl <= K) {
-        // 第1个向量块
+        // First vector block
         svbool_t pg1 = svwhilelt_b32((uint32_t)k, (uint32_t)K);
         svfloat32_t v1 = svld1_f32(pg1, row + k);
         svfloat32_t av1 = svabs_f32_x(pg1, v1);
         svbool_t keep1 = svcmpge_f32(pg1, av1, vthr);
         nnz += (int64_t)svcntp_b32(pg1, keep1);
 
-        // 第2个向量块
+        // Second vector block
         svbool_t pg2 = svwhilelt_b32((uint32_t)(k + vl), (uint32_t)K);
         svfloat32_t v2 = svld1_f32(pg2, row + k + vl);
         svfloat32_t av2 = svabs_f32_x(pg2, v2);
@@ -96,7 +95,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
         k += 2 * vl;
       }
 
-      // 处理剩余不足2*vl部分
+      // Tail loop: process remaining elements (< 2*vl)
       while (k < K) {
         svbool_t pg = svwhilelt_b32((uint32_t)k, (uint32_t)K);
         svfloat32_t v = svld1_f32(pg, row + k);
@@ -106,7 +105,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
         k += svcntw();
       }
 #else
-      // 标量回退路径
+      // Scalar fallback
       for (int64_t k = 0; k < K; ++k) {
         float x = row[k];
         if (x >= thr || x <= -thr) {
@@ -118,7 +117,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
     }
   }
 
-  // 计算行前缀和（row_offsets，长度M+1）
+  // ---------------- Pass 2: Compute row offsets (prefix sum, length M+1) ----------------
   std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
@@ -126,11 +125,11 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
   }
   const int64_t total_nnz = row_offsets[M];
 
-  // 分配输出的列索引数组（uint32，一维压平）
+  // ---------------- Allocate output column index array (uint32, flattened) ----------------
   Tensor nz_col_indices = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
   uint32_t* out_idx = (total_nnz > 0 ? nz_col_indices.data_ptr<uint32_t>() : nullptr);
 
-  // Pass2：按照前缀和将各行非零列索引压缩写入输出数组
+  // ---------------- Pass 3: Write compressed column indices by row (using row_offsets) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -145,7 +144,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
 #endif
     for (int64_t m = 0; m < M; ++m) {
       const int64_t nnz = counts[m];
-      if (nnz == 0) continue;  // 无非零元素则跳过
+      if (nnz == 0) continue;
 
       const float* row = act + m * K;
       uint32_t* dst = out_idx + row_offsets[m];
@@ -153,7 +152,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
 
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE2)
       if (nnz == K) {
-        // 整行全满足阈值，直接输出 [0..K-1]
+        // Fast path: all elements in row meet threshold, output [0..K-1] directly
         int64_t kk = 0;
         while (kk < K) {
           svbool_t pg = svwhilelt_b32((uint32_t)kk, (uint32_t)K);
@@ -164,9 +163,9 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
         write_pos = nnz;
       } else {
         int64_t k = 0;
-        // 向量输出循环展开2倍
+        // Main loop: process 2 vector blocks per iteration
         while (k + 2 * (int64_t)vl <= K) {
-          // 第1个向量块筛选并写出
+          // First vector block: filter and write
           svbool_t pg1 = svwhilelt_b32((uint32_t)k, (uint32_t)K);
           svfloat32_t v1 = svld1_f32(pg1, row + k);
           svfloat32_t av1 = svabs_f32_x(pg1, v1);
@@ -185,7 +184,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
             write_pos += n1;
             }
           }
-          // 第2个向量块筛选并写出
+          // Second vector block: filter and write
           svbool_t pg2 = svwhilelt_b32((uint32_t)(k + vl), (uint32_t)K);
           svfloat32_t v2 = svld1_f32(pg2, row + k + vl);
           svfloat32_t av2 = svabs_f32_x(pg2, v2);
@@ -206,7 +205,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
           }
           k += 2 * vl;
         }
-        // 处理剩余不足2*vl的部分
+        // Tail loop: process remaining elements (< 2*vl)
         while (k < K) {
           svbool_t pg = svwhilelt_b32((uint32_t)k, (uint32_t)K);
           svfloat32_t v = svld1_f32(pg, row + k);
@@ -234,9 +233,8 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
         }
       }
 #else
-      // 标量回退路径
+      // Scalar fallback
       if (nnz == K) {
-        // 整行全部输出
         for (uint32_t k = 0; k < (uint32_t)K; ++k) {
           dst[write_pos++] = k;
         }
@@ -252,7 +250,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
     }
   }
 
-  // // 构建 nz_counts 数组（仅记录有非零值的行及其nnz），形式：[row_index, nnz, row_index2, nnz2, ...]
+  // nz_counts: optional compact form [row_index, nnz, row_index2, nnz2, ...]; currently 2*M placeholder
   // int64_t num_nz_rows = 0;
   // for (int64_t m = 0; m < M; ++m) {
   //   if (counts[m] > 0) num_nz_rows++;
@@ -275,9 +273,9 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
   return {nz_counts, nz_col_indices, row_offsets_t};
 }
 
-// 注册到 PyTorch
-// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
-// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("thr_sparsify_to_icsr_sve(Tensor activation, float threshold) -> (Tensor, Tensor, Tensor)");
 }

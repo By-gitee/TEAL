@@ -288,7 +288,7 @@ mask_sparsify_to_csc_scatter(torch::Tensor activation, torch::Tensor mask) {
   return {col_ptr, row_indices, values};
 }
 
-// Register to PyTorch
+// Register to PyTorch.
 // Note: This file is compiled with other operator sources into the same extension.
 // Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {

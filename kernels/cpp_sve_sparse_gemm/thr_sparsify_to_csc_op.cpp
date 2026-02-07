@@ -23,7 +23,7 @@ static inline void check_thr_sparsify_to_csc_inputs(const Tensor& activation) {
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D [M, K]");
 }
 
-// Fast abs without libm
+// Fast abs without calling libm (bit trick). Works for IEEE-754 float.
 static inline float abs_f32_fast(float x) {
   union { float f; uint32_t u; } v;
   v.f = x;
@@ -31,6 +31,25 @@ static inline float abs_f32_fast(float x) {
   return v.f;
 }
 
+/**
+ * thr_sparsify_to_csc(activation, threshold) -> (col_ptr, row_indices, values)
+ *
+ * Converts a dense matrix to CSC sparse format based on threshold.
+ *
+ * Args:
+ *   activation: (M, K) float32 dense matrix
+ *   threshold: float threshold, elements with abs(x) >= threshold are kept
+ *
+ * Returns:
+ *   col_ptr: int64 [K+1] CSC column pointer array (prefix sum)
+ *   row_indices: uint32 [nnz] row index array
+ *   values: float32 [nnz] non-zero element value array
+ *
+ * Implementation strategy:
+ *   Pass 1: Thread-local counts per column (optionally SVE vectorized)
+ *   Pass 2: Reduce to col_counts, build col_ptr (prefix sum)
+ *   Pass 3: Write row_indices and values without atomics (per-thread base offsets)
+ */
 static std::tuple<Tensor, Tensor, Tensor>
 thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
   check_thr_sparsify_to_csc_inputs(activation);
@@ -45,7 +64,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
   num_threads = omp_get_max_threads();
 #endif
 
-  // Pass1: thread-local counts per column (u32 is enough; M is small in your workloads)
+  // ---------------- Pass 1: Thread-local counts per column (uint32) ----------------
   std::vector<uint32_t> local_counts((size_t)num_threads * (size_t)K, 0);
 
 #ifdef _OPENMP
@@ -103,7 +122,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
     }
   }
 
-  // Reduce counts to col_counts (int64)
+  // ---------------- Reduce thread-local counts to col_counts (int64) ----------------
   std::vector<int64_t> col_counts((size_t)K, 0);
 
 #ifdef _OPENMP
@@ -118,7 +137,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
     col_counts[kk] = sum;
   }
 
-  // Pass2: build col_ptr (int64)
+  // ---------------- Pass 2: Build col_ptr (int64 [K+1], prefix sum) ----------------
   Tensor col_ptr = torch::empty({K + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* ptr = col_ptr.data_ptr<int64_t>();
   ptr[0] = 0;
@@ -133,7 +152,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
   Tensor values = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
   float* out_val = (total_nnz > 0) ? values.data_ptr<float>() : nullptr;
 
-  // Build per-thread base offsets: thread_base[tid][k] = ptr[k] + sum_{t'<tid} local_counts[t'][k]
+  // ---------------- Build per-thread write base offsets ----------------
   std::vector<int64_t> thread_base((size_t)num_threads * (size_t)K, 0);
 
 #ifdef _OPENMP
@@ -152,7 +171,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
 #endif
   }
 
-  // Pass3: write without atomics
+  // ---------------- Pass 3: Write row_indices and values (no atomics) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -199,6 +218,9 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
   return {col_ptr, row_indices, values};
 }
 
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("thr_sparsify_to_csc(Tensor activation, float threshold) -> (Tensor col_ptr, Tensor row_indices, Tensor values)");
 }

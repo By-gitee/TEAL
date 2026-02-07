@@ -28,22 +28,22 @@ static inline void check_mask_sparsify_to_csc_inputs(const Tensor& activation, c
 
 /**
  * mask_sparsify_to_csc(activation, mask) -> (col_ptr, row_indices, values)
- * 
- * 根据 mask 将稠密矩阵转换为 CSC (Compressed Sparse Column) 格式的稀疏矩阵。
- * 
+ *
+ * Converts dense matrix to CSC (Compressed Sparse Column) format based on mask.
+ *
  * Args:
- *   activation: (M, K) float32 稠密矩阵
- *   mask: (M, K) uint8 掩码矩阵，非零元素标记需要保留的位置
- * 
+ *   activation: (M, K) float32 dense matrix
+ *   mask: (M, K) uint8 mask matrix; non-zero indicates positions to keep
+ *
  * Returns:
- *   col_ptr: int64 [K+1] 列指针数组
- *   row_indices: uint32 [nnz] 行索引数组（每列内按行排序）
- *   values: float32 [nnz] 非零元素值数组
- * 
- * 实现策略：
- *   Pass 1: 并行统计每列的非零元素数量（使用线程局部计数）
- *   Pass 2: 规约线程局部计数，构建列指针（前缀和）
- *   Pass 3: 并行填充 CSC 数据结构（row_indices, values）
+ *   col_ptr: int64 [K+1] column pointer array
+ *   row_indices: uint32 [nnz] row index array (sorted by row within each column)
+ *   values: float32 [nnz] non-zero element values
+ *
+ * Implementation:
+ *   Pass 1: Parallel count nnz per column (thread-local counts)
+ *   Pass 2: Reduce thread-local counts and build col_ptr (prefix sum)
+ *   Pass 3: Parallel fill CSC (row_indices, values)
  */
 static std::tuple<Tensor, Tensor, Tensor>
 mask_sparsify_to_csc(torch::Tensor activation, torch::Tensor mask) {
@@ -187,9 +187,9 @@ mask_sparsify_to_csc(torch::Tensor activation, torch::Tensor mask) {
   return {col_ptr, row_indices, values};
 }
 
-// 注册到 PyTorch
-// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
-// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("mask_sparsify_to_csc(Tensor activation, Tensor mask) -> (Tensor col_ptr, Tensor row_indices, Tensor values)");
 }

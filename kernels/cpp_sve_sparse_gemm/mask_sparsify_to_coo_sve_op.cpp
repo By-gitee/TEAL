@@ -1,5 +1,5 @@
 // mask_sparsify_to_coo_sve_op.cpp
-// 基于 mask 的 COO 稀疏化算子，使用 SVE/SVE2 优化
+// Mask-based COO sparsify operator with SVE/SVE2 optimization.
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -33,29 +33,29 @@ static inline void check_mask_sparsify_to_coo_sve_inputs(const Tensor& activatio
 
 /**
  * mask_sparsify_to_coo_sve(activation, mask) -> (row_indices, col_indices, values)
- * 
- * 将稠密矩阵根据 mask 转换为 COO 格式的稀疏矩阵（SVE/SVE2 加速版本）。
- * 
+ *
+ * Converts dense matrix to COO format based on mask (SVE/SVE2 accelerated).
+ *
  * Args:
- *   activation: (M, K) float32 稠密矩阵
- *   mask: (M, K) uint8 掩码矩阵，非零处表示要保留的元素位置
- * 
+ *   activation: (M, K) float32 dense matrix
+ *   mask: (M, K) uint8 mask matrix; non-zero indicates positions to keep
+ *
  * Returns:
- *   row_indices: int64 [nnz] 行索引数组（已按行排序）
- *   col_indices: uint32 [nnz] 列索引数组
- *   values: float32 [nnz] 非零元素值数组
- * 
- * 实现策略（SVE 优化）：
- *   Pass 1: 使用 SVE 向量化统计每行的非零元素数量（基于 mask）
- *     - svld1_u8: 向量加载 uint8 mask
- *     - svcmpne_n_u8: 向量比较 mask != 0
- *     - svcntp_b8: 计数满足条件的元素
- *   Pass 2: 计算行偏移（前缀和）
- *   Pass 3: 使用 SVE2 compact 指令压缩填充 COO 三元组
- *     - svld1ub_u32: 加载 uint8 mask 并扩展为 uint32
- *     - svindex_u32: 生成索引序列
- *     - svcompact_u32/svcompact_f32: 压缩满足条件的元素
- *     - 优化：全保留块跳过 compact 直接写入
+ *   row_indices: int64 [nnz] row index array (sorted by row)
+ *   col_indices: uint32 [nnz] column index array
+ *   values: float32 [nnz] non-zero element values
+ *
+ * Implementation (SVE optimized):
+ *   Pass 1: SVE vectorized count of nnz per row (mask-based)
+ *     - svld1_u8: vector load uint8 mask
+ *     - svcmpne_n_u8: vector compare mask != 0
+ *     - svcntp_b8: count lanes where condition holds
+ *   Pass 2: Compute row offsets (prefix sum)
+ *   Pass 3: Fill COO triplets using SVE2 compact
+ *     - svld1ub_u32: load uint8 mask zero-extended to uint32
+ *     - svindex_u32: generate index sequence
+ *     - svcompact_u32/svcompact_f32: compact lanes where mask is non-zero
+ *     - Optimization: full-keep chunks skip compact and write directly
  */
 static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor& activation, const Tensor& mask) {
   check_mask_sparsify_to_coo_sve_inputs(activation, mask);
@@ -69,13 +69,13 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* counts = counts_t.data_ptr<int64_t>();
 
-  // ---------------- Pass1: count nnz per row (SVE 向量化) ----------------
+  // ---------------- Pass1: count nnz per row (SVE vectorized) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
   {
 #if defined(__ARM_FEATURE_SVE)
-    const size_t vl_u8 = svcntb();   // uint8_t 向量长度（字节数）
+    const size_t vl_u8 = svcntb();   // uint8_t vector length in bytes
 #endif
 
 #ifdef _OPENMP
@@ -86,29 +86,28 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
       int64_t nnz = 0;
 
 #if defined(__ARM_FEATURE_SVE)
-      // 使用 uint8 向量化统计非零个数
-      // 4倍展开优化（uint8_t 的 VL 通常比 float32 大4倍）
+      // Vectorized nnz count using uint8; 4x unroll (uint8 VL is 4x float32 VL)
       int64_t k = 0;
       while (k + 4 * (int64_t)vl_u8 <= K) {
-        // 第1个向量块
+        // 1st vector chunk
         svbool_t pg1 = svwhilelt_b8((uint64_t)k, (uint64_t)K);
         svuint8_t v1 = svld1_u8(pg1, mask_row + k);
         svbool_t keep1 = svcmpne_n_u8(pg1, v1, 0);
         nnz += (int64_t)svcntp_b8(pg1, keep1);
         
-        // 第2个向量块
+        // 2nd vector chunk
         svbool_t pg2 = svwhilelt_b8((uint64_t)(k + vl_u8), (uint64_t)K);
         svuint8_t v2 = svld1_u8(pg2, mask_row + k + vl_u8);
         svbool_t keep2 = svcmpne_n_u8(pg2, v2, 0);
         nnz += (int64_t)svcntp_b8(pg2, keep2);
         
-        // 第3个向量块
+        // 3rd vector chunk
         svbool_t pg3 = svwhilelt_b8((uint64_t)(k + 2 * vl_u8), (uint64_t)K);
         svuint8_t v3 = svld1_u8(pg3, mask_row + k + 2 * vl_u8);
         svbool_t keep3 = svcmpne_n_u8(pg3, v3, 0);
         nnz += (int64_t)svcntp_b8(pg3, keep3);
         
-        // 第4个向量块
+        // 4th vector chunk
         svbool_t pg4 = svwhilelt_b8((uint64_t)(k + 3 * vl_u8), (uint64_t)K);
         svuint8_t v4 = svld1_u8(pg4, mask_row + k + 3 * vl_u8);
         svbool_t keep4 = svcmpne_n_u8(pg4, v4, 0);
@@ -116,7 +115,7 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
         
         k += 4 * vl_u8;
       }
-      // 处理剩余部分
+      // Handle remainder
       while (k < K) {
         svbool_t pg = svwhilelt_b8((uint64_t)k, (uint64_t)K);
         svuint8_t v = svld1_u8(pg, mask_row + k);
@@ -158,7 +157,7 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
 #endif
   {
 #if defined(__ARM_FEATURE_SVE)
-    const int64_t vl = (int64_t)svcntw();  // uint32_t/float32 向量长度
+    const int64_t vl = (int64_t)svcntw();  // uint32_t/float32 vector length in lanes
 #endif
 
 #ifdef _OPENMP
@@ -176,7 +175,7 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
       int64_t write_pos = 0;
 
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE2)
-      // Full-keep fast path: nnz == K (所有元素都在 mask 中)
+      // Full-keep fast path: nnz == K (all elements in mask)
       if (nnz == K) {
         int64_t k = 0;
         while (k < K) {
@@ -184,7 +183,7 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
           const svuint32_t vidx = svindex_u32((uint32_t)k, 1);
           const svfloat32_t vx = svld1_f32(pg, act_row + k);
           
-          // 填充行索引（所有元素都是当前行 m）
+          // Fill row indices (all elements belong to current row m)
           const int64_t chunk_len = (K - k < vl) ? (K - k) : vl;
           for (int64_t i = 0; i < chunk_len; ++i) {
             dst_row[k + i] = m;
@@ -197,52 +196,91 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
         continue;
       }
 
-      // General path: 使用 SVE2 compact 指令压缩数据
+      // General path: use SVE2 compact to compress data; 2-way unroll.
       int64_t k = 0;
+      while (k + 2 * vl <= K) {
+        // Vector block 1
+        const svbool_t pg1 = svwhilelt_b32((uint32_t)k, (uint32_t)K);
+        const svuint32_t vmask1 = svld1ub_u32(pg1, mask_row + k);
+        const svbool_t keep1 = svcmpne_n_u32(pg1, vmask1, 0);
+        const svfloat32_t vx1 = svld1_f32(pg1, act_row + k);
+        const uint32_t n_keep1 = (uint32_t)svcntp_b32(pg1, keep1);
+        if (n_keep1) {
+          int64_t chunk_len1 = K - k;
+          if (chunk_len1 > vl) chunk_len1 = vl;
+          if ((int64_t)n_keep1 == chunk_len1) {
+            const svuint32_t vidx1 = svindex_u32((uint32_t)k, 1);
+            for (int64_t i = 0; i < chunk_len1; ++i) dst_row[write_pos + i] = m;
+            svst1_u32(pg1, dst_col + write_pos, vidx1);
+            svst1_f32(pg1, dst_val + write_pos, vx1);
+            write_pos += chunk_len1;
+          } else {
+            const svuint32_t vidx1 = svindex_u32((uint32_t)k, 1);
+            const svuint32_t packed_col1 = svcompact_u32(keep1, vidx1);
+            const svfloat32_t packed_val1 = svcompact_f32(keep1, vx1);
+            const svbool_t pg_out1 = svwhilelt_b32((uint32_t)0, n_keep1);
+            for (uint32_t i = 0; i < n_keep1; ++i) dst_row[write_pos + i] = m;
+            svst1_u32(pg_out1, dst_col + write_pos, packed_col1);
+            svst1_f32(pg_out1, dst_val + write_pos, packed_val1);
+            write_pos += (int64_t)n_keep1;
+          }
+        }
+
+        // Vector block 2
+        const svbool_t pg2 = svwhilelt_b32((uint32_t)(k + vl), (uint32_t)K);
+        const svuint32_t vmask2 = svld1ub_u32(pg2, mask_row + k + vl);
+        const svbool_t keep2 = svcmpne_n_u32(pg2, vmask2, 0);
+        const svfloat32_t vx2 = svld1_f32(pg2, act_row + k + vl);
+        const uint32_t n_keep2 = (uint32_t)svcntp_b32(pg2, keep2);
+        if (n_keep2) {
+          int64_t chunk_len2 = K - (k + vl);
+          if (chunk_len2 > vl) chunk_len2 = vl;
+          if ((int64_t)n_keep2 == chunk_len2) {
+            const svuint32_t vidx2 = svindex_u32((uint32_t)(k + vl), 1);
+            for (int64_t i = 0; i < chunk_len2; ++i) dst_row[write_pos + i] = m;
+            svst1_u32(pg2, dst_col + write_pos, vidx2);
+            svst1_f32(pg2, dst_val + write_pos, vx2);
+            write_pos += chunk_len2;
+          } else {
+            const svuint32_t vidx2 = svindex_u32((uint32_t)(k + vl), 1);
+            const svuint32_t packed_col2 = svcompact_u32(keep2, vidx2);
+            const svfloat32_t packed_val2 = svcompact_f32(keep2, vx2);
+            const svbool_t pg_out2 = svwhilelt_b32((uint32_t)0, n_keep2);
+            for (uint32_t i = 0; i < n_keep2; ++i) dst_row[write_pos + i] = m;
+            svst1_u32(pg_out2, dst_col + write_pos, packed_col2);
+            svst1_f32(pg_out2, dst_val + write_pos, packed_val2);
+            write_pos += (int64_t)n_keep2;
+          }
+        }
+        k += 2 * vl;
+      }
+      // Remainder
       while (k < K) {
         const svbool_t pg = svwhilelt_b32((uint32_t)k, (uint32_t)K);
-
-        // 从 uint8 mask 加载并转换为 uint32 进行判断（配合 float32 处理）
         const svuint32_t vmask = svld1ub_u32(pg, mask_row + k);
         const svbool_t keep = svcmpne_n_u32(pg, vmask, 0);
         const svfloat32_t vx = svld1_f32(pg, act_row + k);
-
         const uint32_t n_keep = (uint32_t)svcntp_b32(pg, keep);
         if (n_keep) {
           int64_t chunk_len = K - k;
           if (chunk_len > vl) chunk_len = vl;
-
-          // If all kept in this chunk, skip compact
           if ((int64_t)n_keep == chunk_len) {
             const svuint32_t vidx = svindex_u32((uint32_t)k, 1);
-            
-            // 填充行索引
-            for (int64_t i = 0; i < chunk_len; ++i) {
-              dst_row[write_pos + i] = m;
-            }
-            
+            for (int64_t i = 0; i < chunk_len; ++i) dst_row[write_pos + i] = m;
             svst1_u32(pg, dst_col + write_pos, vidx);
             svst1_f32(pg, dst_val + write_pos, vx);
             write_pos += chunk_len;
           } else {
-            // 使用 compact 指令压缩
             const svuint32_t vidx = svindex_u32((uint32_t)k, 1);
             const svuint32_t packed_col = svcompact_u32(keep, vidx);
             const svfloat32_t packed_val = svcompact_f32(keep, vx);
-
             const svbool_t pg_out = svwhilelt_b32((uint32_t)0, n_keep);
-            
-            // 填充行索引
-            for (uint32_t i = 0; i < n_keep; ++i) {
-              dst_row[write_pos + i] = m;
-            }
-            
+            for (uint32_t i = 0; i < n_keep; ++i) dst_row[write_pos + i] = m;
             svst1_u32(pg_out, dst_col + write_pos, packed_col);
             svst1_f32(pg_out, dst_val + write_pos, packed_val);
             write_pos += (int64_t)n_keep;
           }
         }
-
         k += vl;
       }
 
@@ -269,9 +307,9 @@ static std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_coo_sve(const Tensor&
   return {row_indices, col_indices, values};
 }
 
-// 注册到 PyTorch
-// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
-// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("mask_sparsify_to_coo_sve(Tensor activation, Tensor mask) -> (Tensor row_indices, Tensor col_indices, Tensor values)");
 }

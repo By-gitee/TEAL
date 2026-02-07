@@ -1,3 +1,6 @@
+// mask_sparsify_to_icsr_sve_op.cpp
+// Mask-based ICSR sparsify (indices only) with SVE/SVE2 optimization.
+
 #include <torch/extension.h>
 #include <cstdint>
 #include <vector>
@@ -28,17 +31,17 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
   const int64_t K = mask.size(1);
   const uint8_t* mask_ptr = mask.data_ptr<uint8_t>();
 
-  // 分配每行非零元素计数数组（int64，便于后续前缀和计算）
+  // Per-row nnz counts (int64) for prefix sum.
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* counts = counts_t.data_ptr<int64_t>();
 
-  // Pass1：统计每行 mask 中非零元素的个数
+  // ---------------- Pass1: count nnz per row ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
   {
 #if defined(__ARM_FEATURE_SVE)
-    const size_t vl = svcntb();  // 每个向量可处理的 uint8_t 数量（动态VL）
+    const size_t vl = svcntb();  // uint8_t vector length (dynamic VL)
 #endif
 
 #ifdef _OPENMP
@@ -49,27 +52,27 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
       int64_t nnz = 0;
 #if defined(__ARM_FEATURE_SVE)
       int64_t k = 0;
-      // 向量循环展开4倍处理（uint8_t 的 VL 是 float32 的4倍）
+      // 4x unroll (uint8_t VL is 4x float32 VL).
       while (k + 4 * (int64_t)vl <= K) {
-        // 第1个向量块
+        // Vector block 1
         svbool_t pg1 = svwhilelt_b8((uint64_t)k, (uint64_t)K);
         svuint8_t v1 = svld1_u8(pg1, row + k);
         svbool_t keep1 = svcmpne_n_u8(pg1, v1, 0);  // mask != 0
         nnz += (int64_t)svcntp_b8(pg1, keep1);
         
-        // 第2个向量块
+        // Vector block 2
         svbool_t pg2 = svwhilelt_b8((uint64_t)(k + vl), (uint64_t)K);
         svuint8_t v2 = svld1_u8(pg2, row + k + vl);
         svbool_t keep2 = svcmpne_n_u8(pg2, v2, 0);
         nnz += (int64_t)svcntp_b8(pg2, keep2);
         
-        // 第3个向量块
+        // Vector block 3
         svbool_t pg3 = svwhilelt_b8((uint64_t)(k + 2 * vl), (uint64_t)K);
         svuint8_t v3 = svld1_u8(pg3, row + k + 2 * vl);
         svbool_t keep3 = svcmpne_n_u8(pg3, v3, 0);
         nnz += (int64_t)svcntp_b8(pg3, keep3);
         
-        // 第4个向量块
+        // Vector block 4
         svbool_t pg4 = svwhilelt_b8((uint64_t)(k + 3 * vl), (uint64_t)K);
         svuint8_t v4 = svld1_u8(pg4, row + k + 3 * vl);
         svbool_t keep4 = svcmpne_n_u8(pg4, v4, 0);
@@ -77,7 +80,7 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
         
         k += 4 * vl;
       }
-      // 处理剩余不足4*vl部分
+      // Remainder (< 4*vl)
       while (k < K) {
         svbool_t pg = svwhilelt_b8((uint64_t)k, (uint64_t)K);
         svuint8_t v = svld1_u8(pg, row + k);
@@ -86,7 +89,7 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
         k += svcntb();
       }
 #else
-      // 标量回退路径
+      // Scalar fallback.
       for (int64_t k = 0; k < K; ++k) {
         if (row[k] != 0) {
           nnz++;
@@ -97,27 +100,28 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
     }
   }
 
-  // 计算行前缀和（row_offsets，长度M+1）
-  Tensor row_offsets = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* offsets = row_offsets.data_ptr<int64_t>();
-  offsets[0] = 0;
+  // ---------------- Row prefix sum (row_offsets, length M+1) ----------------
+  std::vector<int64_t> row_offsets(M + 1);
+  // Tensor row_offsets = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  // int64_t* offsets = row_offsets.data_ptr<int64_t>();
+  row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
-    offsets[m + 1] = offsets[m] + counts[m];
+    row_offsets[m + 1] = row_offsets[m] + counts[m];
   }
-  const int64_t total_nnz = offsets[M];
+  const int64_t total_nnz = row_offsets[M];
 
-  // 分配输出的列索引数组（uint32，一维压平）
+  // ---------------- Allocate nz_col_indices (uint32, flattened) ----------------
   Tensor nz_col_indices = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
   uint32_t* out_idx = (total_nnz > 0 ? nz_col_indices.data_ptr<uint32_t>() : nullptr);
 
-  // Pass2：按照前缀和将各行非零列索引压缩写入输出数组
+  // ---------------- Pass2: compact write col indices per row ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
   {
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE2)
-    const size_t vl_u8 = svcntb();   // uint8_t 向量长度
-    const size_t vl_u32 = svcntw();  // uint32_t 向量长度
+    const size_t vl_u8 = svcntb();   // uint8_t vector length
+    const size_t vl_u32 = svcntw();  // uint32_t vector length
 #endif
 
 #ifdef _OPENMP
@@ -125,14 +129,14 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
 #endif
     for (int64_t m = 0; m < M; ++m) {
       const int64_t nnz = counts[m];
-      if (nnz == 0) continue;  // 无非零元素则跳过
+      if (nnz == 0) continue;
 
       const uint8_t* row = mask_ptr + m * K;
-      uint32_t* dst = out_idx + offsets[m];
+      uint32_t* dst = out_idx + row_offsets[m];
       int64_t write_pos = 0;
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE2)
       if (nnz == K) {
-        // 整行全满足条件，直接输出 [0..K-1]
+        // Full row: output [0..K-1] directly.
         int64_t kk = 0;
         while (kk < K) {
           svbool_t pg = svwhilelt_b32((uint32_t)kk, (uint32_t)K);
@@ -142,16 +146,11 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
         }
         write_pos = nnz;
       } else {
-        // SVE2 优化路径：利用 svcompact 指令进行高效压缩
-        // 由于 mask 是 uint8_t，我们需要按 uint32_t 的步长处理以匹配输出
+        // SVE2 path: compress with svcompact; process in uint32 lanes to match output.
         int64_t k = 0;
-        // 按 vl_u32 块处理（对应输出的向量长度）
         while (k + 2 * (int64_t)vl_u32 <= K) {
-          // 第1个向量块（uint32）
+          // Vector block 1 (uint32)
           svbool_t pg1 = svwhilelt_b32((uint32_t)k, (uint32_t)K);
-          // 从 uint8 mask 加载并转换判断
-          svbool_t pg1_u8 = svwhilelt_b8((uint64_t)k, (uint64_t)K);
-          // 将 uint8 扩展为 uint32 以便比较
           svuint32_t vmask1_u32 = svld1ub_u32(pg1, row + k);
           svbool_t keep1 = svcmpne_n_u32(pg1, vmask1_u32, 0);
           int64_t n1 = (int64_t)svcntp_b32(pg1, keep1);
@@ -163,7 +162,7 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
             write_pos += n1;
           }
           
-          // 第2个向量块（uint32）
+          // Vector block 2 (uint32)
           svbool_t pg2 = svwhilelt_b32((uint32_t)(k + vl_u32), (uint32_t)K);
           svuint32_t vmask2_u32 = svld1ub_u32(pg2, row + k + vl_u32);
           svbool_t keep2 = svcmpne_n_u32(pg2, vmask2_u32, 0);
@@ -177,7 +176,7 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
           }
           k += 2 * vl_u32;
         }
-        // 处理剩余部分
+        // Remainder
         while (k < K) {
           svbool_t pg = svwhilelt_b32((uint32_t)k, (uint32_t)K);
           svuint32_t vmask_u32 = svld1ub_u32(pg, row + k);
@@ -194,9 +193,8 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
         }
       }
 #else
-      // 标量回退路径
+      // Scalar fallback.
       if (nnz == K) {
-        // 整行全部输出
         for (uint32_t k = 0; k < (uint32_t)K; ++k) {
           dst[write_pos++] = k;
         }
@@ -211,28 +209,17 @@ std::tuple<Tensor, Tensor, Tensor> mask_sparsify_to_icsr_sve(const Tensor& mask)
     }
   }
 
-  // // 构建 nz_counts 数组（仅记录有非零值的行及其nnz），形式：[row_index, nnz, row_index2, nnz2, ...]
-  // int64_t num_nz_rows = 0;
-  // for (int64_t m = 0; m < M; ++m) {
-  //   if (counts[m] > 0) num_nz_rows++;
-  // }
+  // nz_counts placeholder (shape 2*M); actual sparse [row, nnz] layout can be built from row_offsets.
   Tensor nz_counts = torch::empty({2 * M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  // Tensor nz_counts = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  // int64_t* nzp = nz_counts.data_ptr<int64_t>();
-  // int64_t p = 0;
-  // for (int64_t m = 0; m < M; ++m) {
-  //   int64_t nnz = counts[m];
-  //   if (nnz > 0) {
-  //     nzp[p++] = m;
-  //     nzp[p++] = nnz;
-  //   }
-  // }
 
-  return std::make_tuple(nz_counts, nz_col_indices, row_offsets);
+  Tensor row_offsets_t = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
+  return std::make_tuple(nz_counts, nz_col_indices, row_offsets_t);
 }
 
-// 注册到 PyTorch
-// 使用 TORCH_LIBRARY_FRAGMENT 避免与其它算子的 TORCH_LIBRARY 重复定义冲突
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("mask_sparsify_to_icsr_sve(Tensor mask) -> (Tensor, Tensor, Tensor)");
 }

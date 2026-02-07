@@ -32,22 +32,22 @@ static inline void check_mask_sparsify_to_coo_inputs(const Tensor& activation, c
 
 /**
  * mask_sparsify_to_coo(activation, mask) -> (row_indices, col_indices, values)
- * 
- * 根据 mask 将稠密矩阵转换为 COO 格式的稀疏矩阵。
- * 
+ *
+ * Converts dense matrix to COO (Coordinate) format based on mask.
+ *
  * Args:
- *   activation: (M, K) float32 稠密矩阵
- *   mask: (M, K) uint8 掩码矩阵，非零元素标记需要保留的位置
- * 
+ *   activation: (M, K) float32 dense matrix
+ *   mask: (M, K) uint8 mask matrix; non-zero elements mark positions to keep
+ *
  * Returns:
- *   row_indices: int64 [nnz] 行索引数组（已按行排序）
- *   col_indices: uint32 [nnz] 列索引数组
- *   values: float32 [nnz] 非零元素值数组
- * 
- * 实现策略：
- *   Pass 1: 并行统计每行的非零元素数量
- *   Pass 2: 计算行偏移（前缀和）
- *   Pass 3: 并行填充 COO 三元组 (row_idx, col_idx, value)
+ *   row_indices: int64 [nnz] row index array (sorted by row)
+ *   col_indices: uint32 [nnz] column index array
+ *   values: float32 [nnz] non-zero element values
+ *
+ * Implementation:
+ *   Pass 1: Count nnz per row in parallel
+ *   Pass 2: Compute row offsets (prefix sum)
+ *   Pass 3: Fill COO triplets (row_idx, col_idx, value) in parallel
  */
 static std::tuple<Tensor, Tensor, Tensor>
 mask_sparsify_to_coo(torch::Tensor activation, torch::Tensor mask) {
@@ -204,9 +204,9 @@ mask_sparsify_to_coo(torch::Tensor activation, torch::Tensor mask) {
   return {row_indices, col_indices, values};
 }
 
-// 注册到 PyTorch
-// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
-// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("mask_sparsify_to_coo(Tensor activation, Tensor mask) -> (Tensor row_indices, Tensor col_indices, Tensor values)");
 }

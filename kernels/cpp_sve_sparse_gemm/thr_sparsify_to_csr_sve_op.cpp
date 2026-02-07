@@ -25,18 +25,18 @@ static inline void check_thr_sparsify_to_csr_sve_inputs(const Tensor& activation
 
 /**
  * thr_sparsify_to_csr_sve(activation, threshold) -> (row_offsets, col_indices, values)
- * 
+ *
  * Converts a dense matrix to CSR sparse format based on threshold (SVE/SVE2 accelerated).
- * 
+ *
  * Args:
  *   activation: (M, K) float32 dense matrix
  *   threshold: float threshold, elements with abs(x) >= threshold are kept
- * 
+ *
  * Returns:
  *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum)
  *   col_indices: uint32 [nnz] column index array
  *   values: float32 [nnz] non-zero element value array
- * 
+ *
  * Implementation Strategy (SVE optimized with 2x loop unrolling):
  *   Pass 1: Count non-zero elements per row using SVE vectorization
  *     - svabs_f32_x + svcmpge_f32: vectorized threshold comparison
@@ -171,7 +171,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_csr_sve(const Tensor& 
       }
 
       int64_t k = 0;
-      // 2x loop unrolling for better instruction-level parallelism
+      // Main loop: process 2 vector blocks per iteration for better ILP
       while (k + 2 * vl <= K) {
         // First vector block
         svbool_t pg1 = svwhilelt_b32((uint32_t)k, (uint32_t)K);
@@ -286,13 +286,13 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_csr_sve(const Tensor& 
     }
   }
 
-  // 将 row_offsets 转为 Tensor 再返回
+  // Convert row_offsets to Tensor and return
   Tensor row_offsets_t = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
   return {row_offsets_t, col_idx, values};
 }
 
-// Register to PyTorch
+// Register to PyTorch.
 // Note: This file is compiled with other operator sources into the same extension.
 // Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {

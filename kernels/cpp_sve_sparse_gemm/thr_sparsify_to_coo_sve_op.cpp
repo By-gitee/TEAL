@@ -24,18 +24,18 @@ static inline void check_thr_sparsify_to_coo_sve_inputs(const Tensor& activation
 
 /**
  * thr_sparsify_to_coo_sve(activation, threshold) -> (row_indices, col_indices, values)
- * 
+ *
  * Converts a dense matrix to COO sparse format based on threshold (SVE/SVE2 accelerated).
- * 
+ *
  * Args:
  *   activation: (M, K) float32 dense matrix
  *   threshold: float threshold, elements with abs(x) >= threshold are kept
- * 
+ *
  * Returns:
  *   row_indices: int64 [nnz] row index array (sorted by row)
  *   col_indices: uint32 [nnz] column index array
  *   values: float32 [nnz] non-zero element value array
- * 
+ *
  * Implementation Strategy (SVE optimized with 2x loop unrolling):
  *   Pass 1: Count non-zero elements per row using SVE vectorization with 2-way unrolling
  *     - Main loop: process 2*vl elements per iteration for better ILP
@@ -358,7 +358,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_coo_sve(const Tensor& 
   return {row_indices, col_indices, values};
 }
 
-// Register to PyTorch
+// Register to PyTorch.
 // Note: This file is compiled with other operator sources into the same extension.
 // Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {

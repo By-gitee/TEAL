@@ -22,7 +22,7 @@ static inline float abs_f32_fast(float x) {
   return v.f;
 }
 
-// --------- Input checks ----------
+// --------- Input checks ---------
 static inline void check_thr_sparsify_to_icsr_inputs(const torch::Tensor& activation) {
   TORCH_CHECK(activation.device().is_cpu(), "activation must be a CPU tensor");
   TORCH_CHECK(activation.dtype() == torch::kFloat32, "activation must be float32");
@@ -30,7 +30,24 @@ static inline void check_thr_sparsify_to_icsr_inputs(const torch::Tensor& activa
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
 }
 
-// --------- Core: thr_sparsify_to_icsr(activation, threshold) -> (nz_counts, nz_col_indices, row_offsets) ----------
+/**
+ * thr_sparsify_to_icsr(activation, threshold) -> (nz_counts, nz_col_indices, row_offsets)
+ *
+ * Converts a dense matrix to ICSR (indexed CSR) sparse format based on threshold.
+ *
+ * Args:
+ *   activation: (M, K) float32 dense matrix
+ *   threshold: float threshold, elements with abs(x) >= threshold are kept
+ *
+ * Returns:
+ *   nz_counts: int64 [2*M] placeholder / non-zero count info
+ *   nz_col_indices: uint32 [nnz] column index array
+ *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum)
+ *
+ * Implementation strategy:
+ *   Pass 1: Count nnz per row (parallel)
+ *   Pass 2: Build row_offsets (prefix sum), then fill nz_col_indices by row
+ */
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
   check_thr_sparsify_to_icsr_inputs(activation);
@@ -40,12 +57,11 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
   const float thr = static_cast<float>(threshold);
   const float* act = activation.data_ptr<float>();
 
-  // Pass1 output (temporary): per-row nnz
-  // Use a Tensor here to keep allocation/ownership overhead comparable with the SVE/SVE2 version.
+  // Per-row nnz counts (int64, for prefix sum)
   auto row_nnz_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* row_nnz = row_nnz_t.data_ptr<int64_t>();
 
-  // ---------------- Pass1: count nnz per row (parallel) ----------------
+  // ---------------- Pass 1: Count nnz per row (parallel) ----------------
   #pragma omp parallel for schedule(static)
   for (int64_t m = 0; m < M; ++m) {
     const float* row_ptr = act + m * K;
@@ -61,8 +77,7 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
     row_nnz[m] = nnz;
   }
 
-  // --------------- Build row_offsets (prefix sum) ---------------
-  // row_offsets: int64 [M+1]
+  // ---------------- Build row_offsets (prefix sum, int64 [M+1]) ----------------
   std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
@@ -92,12 +107,11 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
   //   }
   // }
 
-  // --------------- Allocate nz_col_indices (flattened) ---------------
+  // ---------------- Allocate nz_col_indices (flattened, uint32) ----------------
   auto nz_col_indices_t = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
   uint32_t* out_idx = (uint32_t*)nz_col_indices_t.data_ptr<uint32_t>();
 
-  // ---------------- Pass2: fill nz_col_indices by row_offsets (parallel) ----------------
-  // Each row writes into [row_offsets[m], row_offsets[m+1]) exclusively => no atomics.
+  // ---------------- Pass 2: Fill nz_col_indices by row (parallel, no atomics) ----------------
   #pragma omp parallel for schedule(static)
   for (int64_t m = 0; m < M; ++m) {
     const int64_t nnz = row_nnz[m];
@@ -178,15 +192,15 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
 #endif
   }
 
-  // 将 row_offsets 转为 Tensor 再返回
+  // Convert row_offsets to Tensor and return
   torch::Tensor row_offsets_t = torch::empty({M + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
   return {nz_counts_t, nz_col_indices_t, row_offsets_t};
 }
 
-// 注册到 PyTorch
-// 注意：该文件会与其它算子源文件一起编译到同一个扩展中，
-// 因此这里必须使用 TORCH_LIBRARY_FRAGMENT，避免与其它 TU 中的 TORCH_LIBRARY 重复定义冲突。
+// Register to PyTorch.
+// Note: This file is compiled with other operator sources into the same extension.
+// Use TORCH_LIBRARY_FRAGMENT to avoid conflicts with TORCH_LIBRARY in other translation units.
 TORCH_LIBRARY_FRAGMENT(sparse_op, m) {
   m.def("thr_sparsify_to_icsr(Tensor activation, float threshold) -> (Tensor nz_counts, Tensor nz_col_indices, Tensor row_offsets)");
 }
