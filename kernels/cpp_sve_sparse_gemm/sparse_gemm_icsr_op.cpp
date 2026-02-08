@@ -14,13 +14,13 @@
  *
  * Input:
  *   - activation: (M, K) float32 contiguous CPU
- *   - weight: (K, N) float32 contiguous CPU
+ *   - weight: (B, K, N) or (K, N) float32 contiguous CPU
  *   - row_offsets: 1D int64 length=M+1 (CSR row pointers)
  *   - nz_col_indices: 1D uint32 length=nnz (CSR column indices)
  *
  * Computation:
- *   For each row i and its non-zeros (k, a):
- *     out[i, :] += a * weight[k, :]
+ *   For each batch b, row i and its non-zeros (k, a):
+ *     out[b, i, :] += a * weight[b, k, :]
  */
 
 namespace {
@@ -41,7 +41,7 @@ void check_inputs_icsr_gemm(
   TORCH_CHECK(nz_col_indices.dtype() == torch::kUInt32, "nz_col_indices must be uint32");
 
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D");
-  TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+  TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3, "weight must be 2D or 3D");
   TORCH_CHECK(row_offsets.dim() == 1, "row_offsets must be 1D");
   TORCH_CHECK(nz_col_indices.dim() == 1, "nz_col_indices must be 1D");
 
@@ -52,7 +52,8 @@ void check_inputs_icsr_gemm(
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
-  TORCH_CHECK(weight.size(0) == K, "weight K dimension must match activation K");
+  const int64_t weight_K = weight.dim() == 2 ? weight.size(0) : weight.size(1);
+  TORCH_CHECK(weight_K == K, "weight K dimension must match activation K");
   TORCH_CHECK(row_offsets.size(0) == M + 1, "row_offsets length must be M+1");
     TORCH_CHECK(row_offsets.data_ptr<int64_t>()[0] == 0, "row_offsets[0] must be 0");
     TORCH_CHECK(row_offsets.data_ptr<int64_t>()[M] == nz_col_indices.numel(), 
@@ -69,9 +70,11 @@ torch::Tensor sparse_gemm_icsr(
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
-  const int64_t N = weight.size(1);
+  const bool is_3d = weight.dim() == 3;
+  const int64_t B = is_3d ? weight.size(0) : 1;
+  const int64_t N = is_3d ? weight.size(2) : weight.size(1);
 
-  auto output = torch::zeros({M, N}, activation.options());
+  auto output = is_3d ? torch::zeros({B, M, N}, activation.options()) : torch::zeros({M, N}, activation.options());
   if (M == 0 || K == 0 || N == 0) {
     return output;
   }
@@ -83,14 +86,18 @@ torch::Tensor sparse_gemm_icsr(
   float* out_ptr = output.data_ptr<float>();
 
   const int64_t n_block_sz = N/16;
-  
   const int64_t n_block = (N + n_block_sz - 1) / n_block_sz;
   
-  // 2D parallelization: each thread handles one (m, nb) tile.
-  // Use local accumulator per tile then single write to reduce rounding error (match SVE gather behavior).
-  #pragma omp parallel for collapse(2) schedule(static)
-  for (int64_t m = 0; m < M; ++m) {
-    for (int64_t nb = 0; nb < n_block; ++nb) {
+  // Process each batch
+  for (int64_t b = 0; b < B; ++b) {
+    const float* batch_weight_ptr = is_3d ? (weight_ptr + b * K * N) : weight_ptr;
+    float* batch_out_ptr = is_3d ? (out_ptr + b * M * N) : out_ptr;
+
+    // 2D parallelization: each thread handles one (m, nb) tile.
+    // Use local accumulator per tile then single write to reduce rounding error (match SVE gather behavior).
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t nb = 0; nb < n_block; ++nb) {
       const int64_t p0 = row_offsets_ptr[m];
       const int64_t p1 = row_offsets_ptr[m + 1];
       if (p0 == p1) continue;

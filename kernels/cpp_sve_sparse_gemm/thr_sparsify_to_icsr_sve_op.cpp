@@ -251,21 +251,21 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
   }
 
   // nz_counts: optional compact form [row_index, nnz, row_index2, nnz2, ...]; currently 2*M placeholder
-  // int64_t num_nz_rows = 0;
-  // for (int64_t m = 0; m < M; ++m) {
-  //   if (counts[m] > 0) num_nz_rows++;
-  // }
-  // Tensor nz_counts = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  Tensor nz_counts = torch::empty({2 * M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  // int64_t* nzp = nz_counts.data_ptr<int64_t>();
-  // int64_t p = 0;
-  // for (int64_t m = 0; m < M; ++m) {
-  //   int64_t nnz = counts[m];
-  //   if (nnz > 0) {
-  //     nzp[p++] = m;
-  //     nzp[p++] = nnz;
-  //   }
-  // }
+  int64_t num_nz_rows = 0;
+  for (int64_t m = 0; m < M; ++m) {
+    if (counts[m] > 0) num_nz_rows++;
+  }
+  Tensor nz_counts = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  // Tensor nz_counts = torch::empty({2 * M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  int64_t* nzp = nz_counts.data_ptr<int64_t>();
+  int64_t p = 0;
+  for (int64_t m = 0; m < M; ++m) {
+    int64_t nnz = counts[m];
+    if (nnz > 0) {
+      nzp[p++] = m;
+      nzp[p++] = nnz;
+    }
+  }
 
   // Return results as tensors
   Tensor row_offsets_t = torch::empty({M + 1}, torch::kInt64);

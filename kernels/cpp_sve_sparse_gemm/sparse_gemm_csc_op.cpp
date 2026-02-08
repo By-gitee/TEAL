@@ -18,15 +18,15 @@
  * CSC × dense weight
  *
  * Input:
- *   - weight: (K, N) float32 contiguous CPU
+ *   - weight: (B, K, N) or (K, N) float32 contiguous CPU
  *   - col_ptr: 1D int64 length=K+1 (CSC column pointer)
  *   - row_indices: 1D uint32 length=nnz (row indices in CSC format)
  *   - values: 1D float32 length=nnz (non-zero values in CSC format)
  *   - M: output matrix row count
  *
  * Computation:
- *   For each column k and its non-zero (m, a):
- *     out[m, :] += a * weight[k, :]
+ *   For each batch b, column k and its non-zero (m, a):
+ *     out[b, m, :] += a * weight[b, k, :]
  *
  * Parallel strategy (Scheme A):
  *   - Parallelize over K blocks (each thread owns a disjoint k-range)
@@ -54,7 +54,7 @@ static inline void check_sparse_gemm_csc_inputs(
   TORCH_CHECK(row_indices.dtype() == torch::kUInt32, "row_indices must be uint32");
   TORCH_CHECK(values.dtype() == torch::kFloat32, "values must be float32");
 
-  TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+  TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3, "weight must be 2D or 3D");
   TORCH_CHECK(col_ptr.dim() == 1, "col_ptr must be 1D");
   TORCH_CHECK(row_indices.dim() == 1, "row_indices must be 1D");
   TORCH_CHECK(values.dim() == 1, "values must be 1D");
@@ -64,10 +64,11 @@ static inline void check_sparse_gemm_csc_inputs(
   TORCH_CHECK(row_indices.is_contiguous(), "row_indices must be contiguous");
   TORCH_CHECK(values.is_contiguous(), "values must be contiguous");
 
-  const int64_t K = weight.size(0);
+  const int64_t K = weight.dim() == 2 ? weight.size(0) : weight.size(1);
   TORCH_CHECK(M >= 0, "M must be non-negative");
   TORCH_CHECK(K > 0, "K must be positive");
-  TORCH_CHECK(weight.size(1) >= 0, "N must be non-negative");
+  const int64_t N = weight.dim() == 2 ? weight.size(1) : weight.size(2);
+  TORCH_CHECK(N >= 0, "N must be non-negative");
   TORCH_CHECK(col_ptr.size(0) == K + 1, "col_ptr length must be K+1");
 
   const int64_t* col_ptr_ptr = col_ptr.data_ptr<int64_t>();
@@ -142,10 +143,12 @@ torch::Tensor sparse_gemm_csc(
 
   check_sparse_gemm_csc_inputs(weight, col_ptr, row_indices, values, M);
 
-  const int64_t K = weight.size(0);
-  const int64_t N = weight.size(1);
+  const bool is_3d = weight.dim() == 3;
+  const int64_t B = is_3d ? weight.size(0) : 1;
+  const int64_t K = is_3d ? weight.size(1) : weight.size(0);
+  const int64_t N = is_3d ? weight.size(2) : weight.size(1);
 
-  auto output = torch::zeros({M, N}, weight.options());
+  auto output = is_3d ? torch::zeros({B, M, N}, weight.options()) : torch::zeros({M, N}, weight.options());
   if (M == 0 || K == 0 || N == 0) return output;
 
   const float* weight_ptr = weight.data_ptr<float>();
@@ -163,43 +166,49 @@ torch::Tensor sparse_gemm_csc(
 #endif
   if (nthreads < 1) nthreads = 1;
 
-  // --- Scheme A: per-thread private output ---
-  // Note: memory overhead = nthreads * M * N * 4 bytes
-  // Acceptable when M <= 256; if N is large and many threads, consider using (M*N_tile) buffer version.
-  std::vector<std::vector<float>> priv((size_t)nthreads);
+  // Process each batch
+  for (int64_t b = 0; b < B; ++b) {
+    const float* batch_weight_ptr = is_3d ? (weight_ptr + b * K * N) : weight_ptr;
+    float* batch_out_ptr = is_3d ? (out_ptr + b * M * N) : out_ptr;
+
+    // --- Scheme A: per-thread private output ---
+    // Note: memory overhead = nthreads * M * N * 4 bytes
+    // Acceptable when M <= 256; if N is large and many threads, consider using (M*N_tile) buffer version.
+    std::vector<std::vector<float>> priv((size_t)nthreads);
 
 #ifdef _OPENMP
-  #pragma omp parallel num_threads((int)nthreads)
+    #pragma omp parallel num_threads((int)nthreads)
 #endif
-  {
-    int tid = 0;
+    {
+      int tid = 0;
 #ifdef _OPENMP
-    tid = omp_get_thread_num();
+      tid = omp_get_thread_num();
 #endif
-    // Zero-initialize thread-private buffer
-    priv[(size_t)tid].assign((size_t)M * (size_t)N, 0.0f);
-    float* out_private = priv[(size_t)tid].data();
+      // Zero-initialize thread-private buffer
+      priv[(size_t)tid].assign((size_t)M * (size_t)N, 0.0f);
+      float* out_private = priv[(size_t)tid].data();
 
-    // Static K-block partitioning: thread tid is responsible for [k0, k1)
-    const int64_t k0 = (K * (int64_t)tid) / nthreads;
-    const int64_t k1 = (K * (int64_t)(tid + 1)) / nthreads;
+      // Static K-block partitioning: thread tid is responsible for [k0, k1)
+      const int64_t k0 = (K * (int64_t)tid) / nthreads;
+      const int64_t k1 = (K * (int64_t)(tid + 1)) / nthreads;
 
-    compute_k_range_private_out(values_ptr, row_indices_ptr, col_ptr_data,
-                                weight_ptr, out_private, M, K, N, k0, k1);
-  }
-
-  // --- Reduction: accumulate each thread's private output into final output ---
-  const int64_t MN = M * N;
-
-#ifdef _OPENMP
-  #pragma omp parallel for schedule(static) num_threads((int)nthreads)
-#endif
-  for (int64_t i = 0; i < MN; ++i) {
-    float acc = 0.0f;
-    for (int t = 0; t < (int)nthreads; ++t) {
-      acc += priv[(size_t)t][(size_t)i];
+      compute_k_range_private_out(values_ptr, row_indices_ptr, col_ptr_data,
+                                  batch_weight_ptr, out_private, M, K, N, k0, k1);
     }
-    out_ptr[(size_t)i] += acc;
+
+    // --- Reduction: accumulate each thread's private output into final output ---
+    const int64_t MN = M * N;
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads((int)nthreads)
+#endif
+    for (int64_t i = 0; i < MN; ++i) {
+      float acc = 0.0f;
+      for (int t = 0; t < (int)nthreads; ++t) {
+        acc += priv[(size_t)t][(size_t)i];
+      }
+      batch_out_ptr[(size_t)i] += acc;
+    }
   }
 
   return output;

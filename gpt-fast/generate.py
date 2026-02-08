@@ -311,7 +311,7 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         is_sparse = False
 
         layer.feed_forward.gemv1_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
-        layer.feed_forward.gemv1 = layer.feed_forward.gemv1_kernel.operator(True)
+        layer.feed_forward.gemv1 = layer.feed_forward.gemv1_kernel.operator(False)
         layer.feed_forward.thresh_up = sparses["up"]
         layer.feed_forward.thresh_gate = sparses["gate"]
         layer.feed_forward.sparsity_bin = 0
@@ -319,13 +319,13 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous().T # T.c.T -> NxK T.c -> KxN . -> NxK column major torch.matmul(x,W.T) W.T -> KxN  W -> NxK
 
         layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
-        layer.feed_forward.gemv2 = layer.feed_forward.gemv2_kernel.operator(True)
+        layer.feed_forward.gemv2 = layer.feed_forward.gemv2_kernel.operator(False)
         layer.feed_forward.thresh_down = sparses["down"]
         layer.feed_forward.sparsity_bin = 0
         layer.feed_forward.w2.weight.data = layer.feed_forward.w2.weight.data.T.contiguous().T # column major
 
         layer.attention.gemv1_kernel = SparseQKVGEMV.initialize("sparse_qkv_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
-        layer.attention.gemv1 = layer.attention.gemv1_kernel.operator(True)
+        layer.attention.gemv1 = layer.attention.gemv1_kernel.operator(False)
         layer.attention.thresh_q = sparses["q"]
         layer.attention.thresh_k = sparses["k"]
         layer.attention.thresh_v = sparses["v"]
@@ -333,7 +333,7 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.attention.wqkv.weight.data = layer.attention.wqkv.weight.data.T.contiguous().T # column major
 
         layer.attention.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
-        layer.attention.gemv2 = layer.attention.gemv2_kernel.operator(True)
+        layer.attention.gemv2 = layer.attention.gemv2_kernel.operator(False)
         layer.attention.thresh_o = sparses["o"]
         layer.attention.sparsity_bin = 0
         layer.attention.wo.weight.data = layer.attention.wo.weight.data.T.contiguous().T # column major
@@ -500,6 +500,11 @@ def main(
                 temperature=temperature,
                 top_k=top_k,
             )
+
+            # 打印统计
+        from kernels.sparse_gemv import DenseGEMV
+        if hist_path is not None:  # 只在使用 monkeypatch 时打印
+            DenseGEMV.print_statistics()
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")

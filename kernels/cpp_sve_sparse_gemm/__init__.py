@@ -28,6 +28,7 @@ from kernels.sve_sparse_gemm import (  # noqa: F401
     SparseGEMMCSCKernel,
     thr_sparsify_to_csc,
     mask_sparsify_to_csc,
+    mask_sparsify_to_csc_scatter,
 )
 
 __all__ = [
@@ -59,5 +60,6 @@ __all__ = [
     "SparseGEMMCSCKernel",
     "thr_sparsify_to_csc",
     "mask_sparsify_to_csc",
+    "mask_sparsify_to_csc_scatter",
 ]
 

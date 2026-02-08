@@ -13,14 +13,14 @@
  * CSR × dense weight with SVE gather optimization
  *
  * Input:
- *   - weight: (K, N) float32 contiguous CPU
+ *   - weight: (B, K, N) or (K, N) float32 contiguous CPU
  *   - row_offsets: 1D int64 length=M+1 (CSR row pointers)
  *   - nz_col_indices: 1D uint32 length=nnz (CSR column indices)
  *   - values: 1D float32 length=nnz (CSR non-zero values)
  *
  * Computation:
- *   For each row i and its non-zeros (k, a):
- *     out[i, :] += a * weight[k, :]
+ *   For each batch b, row i and its non-zeros (k, a):
+ *     out[b, i, :] += a * weight[b, k, :]
  *   Optimized with SVE gather load for weight matrix access
  */
 
@@ -41,7 +41,7 @@ void check_inputs_csr_sve_gather(
   TORCH_CHECK(nz_col_indices.dtype() == torch::kUInt32,"nz_col_indices must be uint32 ");
   TORCH_CHECK(values.dtype() == torch::kFloat32, "values must be float32");
 
-  TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+  TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3, "weight must be 2D or 3D");
   TORCH_CHECK(row_offsets.dim() == 1, "row_offsets must be 1D");
   TORCH_CHECK(nz_col_indices.dim() == 1, "nz_col_indices must be 1D");
   TORCH_CHECK(values.dim() == 1, "values must be 1D");
@@ -51,7 +51,7 @@ void check_inputs_csr_sve_gather(
   TORCH_CHECK(nz_col_indices.is_contiguous(), "nz_col_indices must be contiguous");
   TORCH_CHECK(values.is_contiguous(), "values must be contiguous");
 
-  const auto K = weight.size(0);
+  const auto K = weight.dim() == 2 ? weight.size(0) : weight.size(1);
   const auto M = row_offsets.size(0) - 1;
   TORCH_CHECK(M > 0, "row_offsets length must be at least 2 (M+1 >= 2)");
   TORCH_CHECK(row_offsets.size(0) == M + 1, "row_offsets length must be M+1");
@@ -73,11 +73,13 @@ torch::Tensor sparse_gemm_csr_sve_gather(
     torch::Tensor values) {
   check_inputs_csr_sve_gather(weight, row_offsets, nz_col_indices, values);
 
-  const int64_t K = weight.size(0);
-  const int64_t N = weight.size(1);
+  const bool is_3d = weight.dim() == 3;
+  const int64_t B = is_3d ? weight.size(0) : 1;
+  const int64_t K = is_3d ? weight.size(1) : weight.size(0);
+  const int64_t N = is_3d ? weight.size(2) : weight.size(1);
   const int64_t M = row_offsets.size(0) - 1;
 
-  auto output = torch::zeros({M, N}, weight.options());
+  auto output = is_3d ? torch::zeros({B, M, N}, weight.options()) : torch::zeros({M, N}, weight.options());
   if (M == 0 || K == 0 || N == 0) {
     return output;
   }
@@ -88,9 +90,14 @@ torch::Tensor sparse_gemm_csr_sve_gather(
   const float* values_ptr = values.data_ptr<float>();
   float* out_ptr = output.data_ptr<float>();
 
+  // Process each batch
+  for (int64_t b = 0; b < B; ++b) {
+    const float* batch_weight_ptr = is_3d ? (weight_ptr + b * K * N) : weight_ptr;
+    float* batch_out_ptr = is_3d ? (out_ptr + b * M * N) : out_ptr;
+
 #if defined(__ARM_FEATURE_SVE)
-  const int64_t vl = svcntw();
-  const uint32_t N_u32 = (uint32_t)N;
+    const int64_t vl = svcntw();
+    const uint32_t N_u32 = (uint32_t)N;
 
     int64_t n_block_sz = N / 16;
     const int64_t n_full = (N / n_block_sz) * n_block_sz;

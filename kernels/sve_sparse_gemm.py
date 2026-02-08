@@ -73,8 +73,8 @@ def _extra_cflags() -> list[str]:
     if os.name == "nt":
         return ["/std:c++17", "/openmp"]
     flags = ["-std=c++17", "-O3", "-fopenmp"]
-    if platform.machine().lower() in {"aarch64", "arm64"}:
-        flags.append("-march=armv8-a+sve2")
+    # if platform.machine().lower() in {"aarch64", "arm64"}:
+    flags.append("-march=armv8-a+sve2")
     return flags
 
 

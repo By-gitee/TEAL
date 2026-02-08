@@ -1,14 +1,15 @@
 """
 Performance test and comparison script for mask_sparsify operators.
 
-This script benchmarks 7 mask-based sparsify operators:
+This script benchmarks 8 mask-based sparsify operators:
 1. mask_sparsify_to_coo - COO format (scalar version)
 2. mask_sparsify_to_coo_sve - COO format (SVE-accelerated)
 3. mask_sparsify_to_csc - CSC format (scalar version)
-4. mask_sparsify_to_csr - CSR format (scalar version)
-5. mask_sparsify_to_csr_sve - CSR format (SVE-accelerated)
-6. mask_sparsify_to_icsr - iCSR format (scalar version)
-7. mask_sparsify_to_icsr_sve - iCSR format (SVE-accelerated)
+4. mask_sparsify_to_csc_scatter - CSC format (SVE scatter-accelerated)
+5. mask_sparsify_to_csr - CSR format (scalar version)
+6. mask_sparsify_to_csr_sve - CSR format (SVE-accelerated)
+7. mask_sparsify_to_icsr - iCSR format (scalar version)
+8. mask_sparsify_to_icsr_sve - iCSR format (SVE-accelerated)
 
 Test contents:
 1. Correctness: ensure all operators produce consistent sparse data
@@ -33,6 +34,7 @@ from kernels.cpp_sve_sparse_gemm import (
     mask_sparsify_to_coo,
     mask_sparsify_to_coo_sve,
     mask_sparsify_to_csc,
+    mask_sparsify_to_csc_scatter,
     mask_sparsify_to_csr,
     mask_sparsify_to_csr_sve,
     mask_sparsify_to_icsr,
@@ -336,6 +338,16 @@ def test_correctness(
         print(f"  ❌ mask_sparsify_to_csc: {e}")
         all_passed = False
 
+    try:
+        col_ptr_csc_scatter, row_idx_csc_scatter, val_csc_scatter = mask_sparsify_to_csc_scatter(activation, mask)
+        if _verify_csc_format(col_ptr_csc_scatter, row_idx_csc_scatter, val_csc_scatter, activation, mask, "mask_sparsify_to_csc_scatter"):
+            print("  ✅ mask_sparsify_to_csc_scatter")
+        else:
+            all_passed = False
+    except Exception as e:
+        print(f"  ❌ mask_sparsify_to_csc_scatter: {e}")
+        all_passed = False
+
     # iCSR format
     print("\n[iCSR format]")
     try:
@@ -410,6 +422,11 @@ def test_performance(
     results["mask_sparsify_to_csc"] = lat
     print(f"    Latency: {lat:.4f} ms")
 
+    print("  Testing mask_sparsify_to_csc_scatter...")
+    lat = measure_latency(lambda: mask_sparsify_to_csc_scatter(activation, mask), warmup=warmup, iters=iters)
+    results["mask_sparsify_to_csc_scatter"] = lat
+    print(f"    Latency: {lat:.4f} ms")
+
     # iCSR format
     print("\n[iCSR format]")
     print("  Testing mask_sparsify_to_icsr...")
@@ -440,7 +457,7 @@ def print_performance_summary(results: Dict[str, float]) -> None:
     print("-" * 80)
 
     for rank, (name, latency) in enumerate(sorted_results, 1):
-        marker = "⚡ SVE" if "sve" in name else "📊 Scalar"
+        marker = "⚡ SVE" if ("sve" in name or "scatter" in name) else "📊 Scalar"
         print(f"{rank:2d}. {name:40s} {latency:8.4f} ms  {marker}")
 
     # Fastest operator
@@ -457,6 +474,7 @@ def print_performance_summary(results: Dict[str, float]) -> None:
     comparisons = [
         ("COO", "mask_sparsify_to_coo", "mask_sparsify_to_coo_sve"),
         ("CSR", "mask_sparsify_to_csr", "mask_sparsify_to_csr_sve"),
+        ("CSC", "mask_sparsify_to_csc", "mask_sparsify_to_csc_scatter"),
         ("iCSR", "mask_sparsify_to_icsr", "mask_sparsify_to_icsr_sve"),
     ]
 
@@ -515,7 +533,7 @@ def test_multiple_sizes(
     print("=" * 80)
 
     # Table header
-    algo_names = ["COO", "COO_SVE", "CSR", "CSR_SVE", "CSC", "iCSR", "iCSR_SVE"]
+    algo_names = ["COO", "COO_SVE", "CSR", "CSR_SVE", "CSC", "CSC_SCATTER", "iCSR", "iCSR_SVE"]
     print(f"\n{'Config':<12}", end="")
     for name in algo_names:
         print(f"{name:>10}", end="")
@@ -531,19 +549,20 @@ def test_multiple_sizes(
         lat_csr = results.get("mask_sparsify_to_csr", 0.0)
         lat_csr_sve = results.get("mask_sparsify_to_csr_sve", 0.0)
         lat_csc = results.get("mask_sparsify_to_csc", 0.0)
+        lat_csc_scatter = results.get("mask_sparsify_to_csc_scatter", 0.0)
         lat_icsr = results.get("mask_sparsify_to_icsr", 0.0)
         lat_icsr_sve = results.get("mask_sparsify_to_icsr_sve", 0.0)
         
         print(f"{lat_coo:10.4f}{lat_coo_sve:10.4f}{lat_csr:10.4f}{lat_csr_sve:10.4f}"
-              f"{lat_csc:10.4f}{lat_icsr:10.4f}{lat_icsr_sve:10.4f}")
+              f"{lat_csc:10.4f}{lat_csc_scatter:10.4f}{lat_icsr:10.4f}{lat_icsr_sve:10.4f}")
     
     # Speedup table
     print("\n" + "=" * 80)
     print("SVE speedup summary")
     print("=" * 80)
 
-    print(f"\n{'Config':<12}{'COO':>10}{'CSR':>10}{'iCSR':>10}")
-    print("-" * 42)
+    print(f"\n{'Config':<12}{'COO':>10}{'CSR':>10}{'CSC':>10}{'iCSR':>10}")
+    print("-" * 52)
     
     for (M, K), results in all_results:
         print(f"({M:2d},{K:5d})", end="  ")
@@ -558,12 +577,17 @@ def test_multiple_sizes(
         lat_csr_sve = results.get("mask_sparsify_to_csr_sve", 0.0)
         speedup_csr = lat_csr / lat_csr_sve if lat_csr_sve > 0 else 0.0
 
+        # CSC speedup (scalar vs scatter)
+        lat_csc = results.get("mask_sparsify_to_csc", 0.0)
+        lat_csc_scatter = results.get("mask_sparsify_to_csc_scatter", 0.0)
+        speedup_csc = lat_csc / lat_csc_scatter if lat_csc_scatter > 0 else 0.0
+
         # iCSR speedup
         lat_icsr = results.get("mask_sparsify_to_icsr", 0.0)
         lat_icsr_sve = results.get("mask_sparsify_to_icsr_sve", 0.0)
         speedup_icsr = lat_icsr / lat_icsr_sve if lat_icsr_sve > 0 else 0.0
         
-        print(f"{speedup_coo:10.2f}x{speedup_csr:10.2f}x{speedup_icsr:10.2f}x")
+        print(f"{speedup_coo:10.2f}x{speedup_csr:10.2f}x{speedup_csc:10.2f}x{speedup_icsr:10.2f}x")
 
 
 def main() -> None:
