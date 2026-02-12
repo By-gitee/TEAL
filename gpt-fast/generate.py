@@ -20,6 +20,16 @@ torch._dynamo.config.suppress_errors = True
 # disable for now, incompatible with our kernel (for accurate baseline)
 # torch._inductor.config.epilogue_fusion = False
 
+# import sve sparse gemm
+from kernels.sve_sparse_gemm import (
+    DenseBaseGEMV,
+    DenseBaseGEMM,
+    QKVSparseGEMViCSRSVEGatherKernel,
+    QKVSparseGEMMiCSRSVEGatherKernel,
+    LNSparseGEMViCSRSVEGatherKernel,
+    LNSparseGEMMiCSRSVEGatherKernel,
+    USE_CUSTOM_SPARSE_GEMM
+)
 
 import torch._dynamo.config
 import torch._inductor.config
@@ -92,7 +102,7 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
                 new_probs.append(next_prob.clone())
                 cur_token = next_token.view(1, -1)
         else:
-            # [By] For CPU
+            # [By] For CPU, NO cuda 
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
@@ -172,16 +182,12 @@ def generate(
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
-    prompt: (T,) 单序列或 (B, T) 批序列；batch_size>1 时 prefill 按批计算，decode 仅对第一条序列继续生成。
     """
-
     is_speculative = draft_model is not None
-    # prompt: (T,) 或 (B, T)；batch_size=1 时为单序列
-    if prompt.dim() == 1:
-        prompt = prompt.unsqueeze(0)  # (1, T)
-    batch_size = prompt.size(0)
-    T = prompt.size(1)
+
+    T = prompt.size(0)
     T_new = T + max_new_tokens
+
     if interactive:
         max_seq_length = 350
     else:
@@ -190,30 +196,28 @@ def generate(
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+            draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
-    # 当前只对 batch 中第 0 条做完整 decode，其余仅做 prefill
-    input_pos = torch.arange(0, T, device=device)
-    next_token = prefill(model, prompt, input_pos, **sampling_kwargs).clone()  # (batch_size,)
-    if is_speculative:
-        prefill(draft_model, prompt, input_pos, **sampling_kwargs)
-
+    # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = prompt[0]
+    empty[:T] = prompt
     seq = empty
-    seq[T] = next_token[0] if next_token.dim() > 0 else next_token
+    input_pos = torch.arange(0, T, device=device)
+
+    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
+    if is_speculative:
+        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+    seq[T] = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
-    # decode 阶段只用第一条序列的 next token
-    cur_next = next_token[0:1] if (next_token.dim() > 0 and next_token.size(0) > 1) else next_token
 
     if is_speculative:
         input_pos = input_pos.item()  # for speculative decoding easier to keep on host
         while input_pos < T_new - 1:
-            cur_token = cur_next.view(())
+            cur_token = next_token.view(())
 
             next_tokens = speculative_decode(
                 model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
@@ -225,9 +229,9 @@ def generate(
             for i in next_tokens[: num_added,]:
                 callback(i)
             input_pos = input_pos + num_added
-            cur_next = next_tokens[-1]
+            next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, cur_next.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[T + 1:] = torch.cat(generated_tokens)
 
     generate_stats = {
@@ -284,6 +288,78 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
     projs = ['q', 'k', 'v', 'o', 'up', 'gate', 'down']
     
     sparsities = {proj: sparse_levels for proj in projs}
+
+    def monkeypatch_layer_sve_sparse(layer_idx, layer, sparsity, hist_path, device):
+        mlp_path = os.path.join(hist_path, f"layer-{layer_idx}", "mlp")
+        attn_path = os.path.join(hist_path, f"layer-{layer_idx}", "self_attn")
+
+        distrs = {}
+
+        distrs["mlp_h1"] = Distribution(mlp_path, "h1")
+        distrs["mlp_h2"] = Distribution(mlp_path, "h2")
+        distrs["attn_h1"] = Distribution(attn_path, "h1")
+        distrs["attn_h2"] = Distribution(attn_path, "h2")
+
+        sparses = {}
+        for proj in projs:
+            val = 0.5 + 0.5*sparsities[proj][layer_idx]
+            if proj in ['q', 'k', 'v']:
+                sparses[proj] = distrs["attn_h1"].icdf(val).item()
+            elif proj in ['o']:
+                sparses[proj] = distrs["attn_h2"].icdf(val).item()
+            elif proj in ['up', 'gate']:
+                sparses[proj] = distrs["mlp_h1"].icdf(val).item()
+            elif proj in ['down']:
+                sparses[proj] = distrs["mlp_h2"].icdf(val).item()
+
+        is_sparse = USE_CUSTOM_SPARSE_GEMM
+
+        layer.feed_forward.gemm1_kernel = LNSparseGEMMiCSRSVEGatherKernel.initialize("ln_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
+        layer.feed_forward.gemm1 = layer.feed_forward.gemm1_kernel.operator(False)
+        layer.feed_forward.gemv1_kernel = LNSparseGEMViCSRSVEGatherKernel.initialize("ln_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
+        layer.feed_forward.gemv1 = layer.feed_forward.gemv1_kernel.operator(False)
+        
+        layer.feed_forward.thresh_up = sparses["up"]
+        layer.feed_forward.thresh_gate = sparses["gate"]
+        layer.feed_forward.sparsity_bin = 0
+        layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.data.T.contiguous() # column major
+        layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous() # T.c.T -> NxK T.c -> KxN . -> NxK column major torch.matmul(x,W.T) W.T -> KxN  W -> NxK
+
+        layer.feed_forward.gemm2_kernel = LNSparseGEMMiCSRSVEGatherKernel.initialize("ln_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
+        layer.feed_forward.gemm2 = layer.feed_forward.gemm2_kernel.operator(False)
+        layer.feed_forward.gemv2_kernel = LNSparseGEMViCSRSVEGatherKernel.initialize("ln_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
+        layer.feed_forward.gemv2 = layer.feed_forward.gemv2_kernel.operator(False)
+        layer.feed_forward.thresh_down = sparses["down"]
+        layer.feed_forward.sparsity_bin = 0
+        layer.feed_forward.w2.weight.data = layer.feed_forward.w2.weight.data.T.contiguous() # column major
+
+        layer.attention.gemm1_kernel = QKVSparseGEMMiCSRSVEGatherKernel.initialize("qkv_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
+        layer.attention.gemm1 = layer.attention.gemm1_kernel.operator(False)
+        layer.attention.gemv1_kernel = QKVSparseGEMViCSRSVEGatherKernel.initialize("qkv_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
+        layer.attention.gemv1 = layer.attention.gemv1_kernel.operator(False)
+        layer.attention.thresh_q = sparses["q"]
+        layer.attention.thresh_k = sparses["k"]
+        layer.attention.thresh_v = sparses["v"]
+        layer.attention.sparsity_bin = 0
+        layer.attention.wqkv.weight.data = layer.attention.wqkv.weight.data.T.contiguous() # column major
+
+        layer.attention.gemm2_kernel = LNSparseGEMMiCSRSVEGatherKernel.initialize("ln_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
+        layer.attention.gemm2 = layer.attention.gemm2_kernel.operator(False)
+        layer.attention.gemv2_kernel = LNSparseGEMViCSRSVEGatherKernel.initialize("ln_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
+        layer.attention.gemv2 = layer.attention.gemv2_kernel.operator(False)
+        layer.attention.thresh_o = sparses["o"]
+        layer.attention.sparsity_bin = 0
+        layer.attention.wo.weight.data = layer.attention.wo.weight.data.T.contiguous() # column major
+
+        # replace forwards
+        layer.feed_forward.apply_monkeypatch()
+        layer.attention.apply_monkeypatch()
+
+        if "cuda" in str(device):
+            torch.cuda.empty_cache()
+        else:
+            import gc
+            gc.collect() # Force garbage collection to free up CPU memory
 
     def monkeypatch_layer(layer_idx, layer, sparsity, hist_path, device):
         mlp_path = os.path.join(hist_path, f"layer-{layer_idx}", "mlp")
@@ -351,10 +427,13 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
     print("Monkeypatching with activation sparsity...")
     print(model.layers[0].feed_forward.w1.weight.data.shape)
     from tp import _get_rank
+    from kernels.sve_sparse_gemm import load_sve_sparse_gemm_extension
+    load_sve_sparse_gemm_extension()
     if hist_path is not None:
         device = model.layers[0].feed_forward.w1.weight.device.type
         for layer_idx, layer in enumerate(model.layers):
-            monkeypatch_layer(layer_idx, layer, sparsity, hist_path, device)     
+            monkeypatch_layer_sve_sparse(layer_idx, layer, sparsity, hist_path, device)     
+            # monkeypatch_layer(layer_idx, layer, sparsity, hist_path, device)     
 
 
     return model.eval()

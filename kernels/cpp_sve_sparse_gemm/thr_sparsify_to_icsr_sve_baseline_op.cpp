@@ -41,23 +41,23 @@ static inline void pack_u32(
 }
 
 /**
- * thr_sparsify_to_icsr_sve_baseline(activation, threshold) -> (row_offsets, nz_col_indices, nz_values)
- * 
+ * thr_sparsify_to_icsr_sve_baseline(activation, threshold) -> (nz_counts, nz_col_indices, row_offsets)
+ *
  * Converts dense matrix to ICSR (Indexed CSR) format - baseline version with 2x loop unrolling.
  * Uses scalar pack_u32 function instead of SVE2 compact instructions.
- * 
+ *
  * Args:
  *   activation: (M, K) float32 dense matrix
  *   threshold: float threshold, elements with abs(x) >= threshold are kept
- * 
+ *
  * Returns:
- *   row_offsets: int64 [M+1] row pointer array
+ *   nz_counts: int64 [M]; nz_counts[0..M-1] = per-row nnz (used for row_offsets)
  *   nz_col_indices: uint32 [nnz] column indices
- *   nz_values: float32 [nnz] values
- * 
+ *   row_offsets: int64 [M+1] row pointer array (prefix sum of nz_counts[0..M-1])
+ *
  * Implementation Strategy:
- *   Pass 1: Count nnz per row with 2x loop unrolling
- *   Pass 2: Extract indices and values using pack_u32 with 2x loop unrolling
+ *   Pass 1: Count nnz per row into nz_counts[0..M-1] with 2x loop unrolling
+ *   Pass 2: Extract indices using pack_u32 with 2x loop unrolling
  */
 std::tuple<Tensor, Tensor, Tensor>
 thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
@@ -68,10 +68,11 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
   const float thr = (float)threshold;
   const float* act = activation.data_ptr<float>();
 
-  Tensor counts_t = torch::empty({M}, torch::kInt64);
-  int64_t* counts = counts_t.data_ptr<int64_t>();
+  // nz_counts_t: M, per-row nnz (used for row_offsets prefix sum)
+  Tensor nz_counts_t = torch::empty({M}, torch::kInt64);
+  int64_t* nz_counts = nz_counts_t.data_ptr<int64_t>();
 
-  // ---------------- Pass 1: Count nnz per row ----------------
+  // ---------------- Pass 1: Count nnz per row into nz_counts[0..M-1] ----------------
 
 #ifdef _OPENMP
 #pragma omp parallel
@@ -128,15 +129,15 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
       if (v >= thr || v <= -thr) nnz++;
     }
 #endif
-    counts[m] = nnz;
+    nz_counts[m] = nnz;
   }
 }
 
-  // ---------------- Compute row offsets (prefix sum) ----------------
+  // ---------------- Compute row_offsets (prefix sum over nz_counts[0..M-1]) ----------------
   std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
-    row_offsets[m + 1] = row_offsets[m] + counts[m];
+    row_offsets[m + 1] = row_offsets[m] + nz_counts[m];
   }
   const int64_t total = row_offsets[M];
 
@@ -161,7 +162,7 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
 #pragma omp for schedule(static)
 #endif
   for (int64_t m = 0; m < M; ++m) {
-    int64_t nnz = counts[m];
+    int64_t nnz = nz_counts[m];
     if (nnz == 0) continue;
 
     const float* row = act + m * K;
@@ -251,27 +252,10 @@ thr_sparsify_to_icsr_sve_baseline(const Tensor& activation, double threshold) {
   }
 }
 
-// ---------------- nz_counts (placeholder 2*M) ----------------
-
-// int64_t rows = 0;
-// for (int64_t m = 0; m < M; ++m) if (counts[m] > 0) rows++;
-
-Tensor nz_counts = torch::empty({2 * M}, torch::kInt64);
-// Tensor nz_counts = torch::empty({2 * rows}, torch::kInt64);
-// int64_t* nzp = nz_counts.data_ptr<int64_t>();
-
-// int64_t p = 0;
-// for (int64_t m = 0; m < M; ++m) {
-//   if (counts[m] > 0) {
-//     nzp[p++] = m;
-//     nzp[p++] = counts[m];
-//   }
-// }
-
   // Return results as tensors
   Tensor row_offsets_t = torch::empty({M + 1}, torch::kInt64);
   std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
-  return {nz_counts, nz_col, row_offsets_t};
+  return {nz_counts_t, nz_col, row_offsets_t};
 }
 
 // PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

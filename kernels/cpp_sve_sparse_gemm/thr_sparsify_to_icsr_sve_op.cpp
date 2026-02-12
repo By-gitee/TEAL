@@ -31,9 +31,9 @@ static inline void check_inputs(const Tensor& activation) {
  *   threshold: float threshold, elements with abs(x) >= threshold are kept
  *
  * Returns:
- *   nz_counts: int64 [2*M] non-zero counts array (row indices and nnz pairs)
+ *   nz_counts: int64 [M]; nz_counts[0..M-1] = per-row nnz (used for row_offsets)
  *   nz_col_indices: uint32 [nnz] column index array
- *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum)
+ *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum of nz_counts[0..M-1])
  *
  * Implementation Strategy (SVE optimized with 2x loop unrolling):
  *   Pass 1: Count non-zero elements per row using SVE vectorization
@@ -53,11 +53,11 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
   const float thr = (float)threshold;
   const float* act = activation.data_ptr<float>();
 
-  // Allocate per-row non-zero count array (int64 for prefix sum)
-  Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* counts = counts_t.data_ptr<int64_t>();
+  // nz_counts_t: M, per-row nnz (used for row_offsets prefix sum)
+  Tensor nz_counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  int64_t* nz_counts = nz_counts_t.data_ptr<int64_t>();
 
-  // ---------------- Pass 1: Count nnz per row (SVE vectorized) ----------------
+  // ---------------- Pass 1: Count nnz per row into nz_counts[0..M-1] (SVE vectorized) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -113,15 +113,15 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
         }
       }
 #endif
-      counts[m] = nnz;
+      nz_counts[m] = nnz;
     }
   }
 
-  // ---------------- Pass 2: Compute row offsets (prefix sum, length M+1) ----------------
+  // ---------------- Pass 2: Compute row_offsets (prefix sum over nz_counts[0..M-1]) ----------------
   std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
-    row_offsets[m + 1] = row_offsets[m] + counts[m];
+    row_offsets[m + 1] = row_offsets[m] + nz_counts[m];
   }
   const int64_t total_nnz = row_offsets[M];
 
@@ -143,7 +143,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
 #pragma omp for schedule(static)
 #endif
     for (int64_t m = 0; m < M; ++m) {
-      const int64_t nnz = counts[m];
+      const int64_t nnz = nz_counts[m];
       if (nnz == 0) continue;
 
       const float* row = act + m * K;
@@ -250,27 +250,10 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
     }
   }
 
-  // nz_counts: optional compact form [row_index, nnz, row_index2, nnz2, ...]; currently 2*M placeholder
-  int64_t num_nz_rows = 0;
-  for (int64_t m = 0; m < M; ++m) {
-    if (counts[m] > 0) num_nz_rows++;
-  }
-  Tensor nz_counts = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  // Tensor nz_counts = torch::empty({2 * M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* nzp = nz_counts.data_ptr<int64_t>();
-  int64_t p = 0;
-  for (int64_t m = 0; m < M; ++m) {
-    int64_t nnz = counts[m];
-    if (nnz > 0) {
-      nzp[p++] = m;
-      nzp[p++] = nnz;
-    }
-  }
-
-  // Return results as tensors
+  // Return results as tensors (nz_counts_t already allocated and filled in Pass 1)
   Tensor row_offsets_t = torch::empty({M + 1}, torch::kInt64);
   std::memcpy(row_offsets_t.data_ptr<int64_t>(), row_offsets.data(), (size_t)(M + 1) * sizeof(int64_t));
-  return {nz_counts, nz_col_indices, row_offsets_t};
+  return {nz_counts_t, nz_col_indices, row_offsets_t};
 }
 
 // Register to PyTorch.

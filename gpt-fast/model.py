@@ -17,172 +17,6 @@ from kernels.sparse_gemv import SparseGEMV
 
 import types
 
-# 自适应稀疏 GEMM 配置
-USE_CUSTOM_SPARSE_GEMM = os.getenv("USE_CUSTOM_SPARSE_GEMM", "0") == "1"
-DENSE_THRESHOLD = 0.8  # 稀疏度 < 0.7 的行被视为 dense
-MIN_DENSE_BLOCK = 4    # 至少连续 4 行才用 dense GEMM
-SPARSE_DEBUG = os.getenv("SPARSE_DEBUG", "0") == "1"
-
-def adaptive_sparse_gemm(
-    x: Tensor,  # (M, K) activation
-    weight: Tensor,  # (N, K) weight in PyTorch Linear (but column-major after monkeypatch)
-    threshold: float,
-) -> Tensor:
-    """
-    自适应稀疏 GEMM：根据激活稀疏度自适应调度 dense/sparse kernel。
-    
-    仅用于 prefill (seq_len > 1)，decode 阶段请使用原 GEMV。
-    
-    调度策略:
-    - 先对 activation 执行 thr_sparsify_to_icsr_sve
-    - 根据每行 nnz 计算稀疏度
-    - 连续 >= MIN_DENSE_BLOCK 行且稀疏度 < DENSE_THRESHOLD → dense torch.matmul
-    - 否则 → sparse_gemm_icsr_sve_gather
-    
-    Args:
-        x: (M, K) activation matrix
-        weight: (N, K) weight matrix from PyTorch Linear layer (column-major after monkeypatch)
-        threshold: sparsification threshold
-    
-    Returns:
-        output: (M, N) result matrix
-    """
-    from kernels.sve_sparse_gemm import (
-        thr_sparsify_to_icsr_sve,
-        SparseGEMMiCSRSVEGatherKernel,
-    )
-    
-    M, K = x.shape
-    N, K_w = weight.shape
-    assert K == K_w, f"Dimension mismatch: x.shape[1]={K}, weight.shape[1]={K_w}"
-    
-    # 1. 稀疏化 activation
-    nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve(x, threshold)
-    
-    # 2. 计算每行 nnz
-    nnz_per_row = torch.zeros(M, dtype=torch.int32)
-    for m in range(M):
-        start = row_offsets[m].item()
-        end = row_offsets[m + 1].item()
-        nnz_per_row[m] = end - start
-    
-    # 边界情况：对于非常小的 M（< MIN_DENSE_BLOCK），根据整体稀疏度决定
-    if M < MIN_DENSE_BLOCK:
-        total_nnz = sum(nnz_per_row).item()
-        avg_sparsity = 1.0 - (total_nnz / (M * K))
-        
-        if avg_sparsity < DENSE_THRESHOLD:
-            # 稀疏度低，用 dense
-            if SPARSE_DEBUG:
-                print(f"[adaptive_sparse_gemm] M={M} < MIN_DENSE_BLOCK={MIN_DENSE_BLOCK}, avg_sparsity={avg_sparsity:.2f} < {DENSE_THRESHOLD}, using dense matmul")
-            return torch.matmul(x, weight.T)
-        else:
-            # 稀疏度高，用 sparse
-            if SPARSE_DEBUG:
-                print(f"[adaptive_sparse_gemm] M={M} < MIN_DENSE_BLOCK={MIN_DENSE_BLOCK}, avg_sparsity={avg_sparsity:.2f} >= {DENSE_THRESHOLD}, using sparse GEMM")
-            
-            from kernels.sve_sparse_gemm import load_sve_sparse_gemm_extension
-            load_sve_sparse_gemm_extension()
-            
-            weight_kn = weight.T.contiguous()
-            output = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                x, weight_kn, row_offsets, nz_col_indices
-            )
-            return output
-    
-    # 3. 划分 dense/sparse block (M >= MIN_DENSE_BLOCK 的情况)
-    # 策略: 扫描每行，连续 >= MIN_DENSE_BLOCK 行且稀疏度 < DENSE_THRESHOLD → dense block
-    dense_blocks = []  # [(start_row, end_row), ...]
-    sparse_blocks = []  # [(start_row, end_row), ...]
-    
-    i = 0
-    while i < M:
-        # 检查当前位置能否形成 dense block
-        sparsity = 1.0 - (nnz_per_row[i].item() / K)
-        
-        if sparsity < DENSE_THRESHOLD:
-            # 尝试扩展 dense block
-            j = i + 1
-            while j < M:
-                s_j = 1.0 - (nnz_per_row[j].item() / K)
-                if s_j < DENSE_THRESHOLD:
-                    j += 1
-                else:
-                    break
-            
-            # 检查是否满足最小 block 长度
-            if j - i >= MIN_DENSE_BLOCK:
-                dense_blocks.append((i, j))
-                i = j
-            else:
-                # 不满足长度要求，划为 sparse
-                sparse_blocks.append((i, j))
-                i = j
-        else:
-            # 当前行稀疏度高，划为 sparse
-            j = i + 1
-            # 扩展连续 sparse 行
-            while j < M:
-                s_j = 1.0 - (nnz_per_row[j].item() / K)
-                if s_j >= DENSE_THRESHOLD:
-                    j += 1
-                else:
-                    break
-            sparse_blocks.append((i, j))
-            i = j
-    
-    # 4. Debug 输出
-    if SPARSE_DEBUG:
-        dense_rows = sum(end - start for start, end in dense_blocks)
-        sparse_rows = sum(end - start for start, end in sparse_blocks)
-        print(f"[adaptive_sparse_gemm] M={M}, K={K}, N={N} threshold={threshold}")
-        print(f"  dense_blocks: {dense_blocks}, total_rows: {dense_rows}")
-        print(f"  sparse_blocks: {sparse_blocks}, total_rows: {sparse_rows}")
-        print(f"  nnz_per_row: {nnz_per_row.tolist()}")
-    
-    # 5. 执行计算并拼接结果
-    output = torch.zeros(M, N, dtype=x.dtype, device=x.device)
-    
-    # Dense blocks: torch.matmul
-    # weight is (N, K) in column-major layout, so x @ weight.T
-    for start, end in dense_blocks:
-        x_block = x[start:end, :]  # (block_size, K)
-        output[start:end, :] = torch.matmul(x_block, weight.T)
-    
-    # Sparse blocks: sparse_gemm_icsr_sve_gather
-    # sparse_gemm_icsr_sve_gather expects weight as (K, N)
-    # Since weight is (N, K) column-major, we need to transpose it
-    weight_kn = weight.T.contiguous()  # (K, N)
-    
-    # 直接使用 torch.ops 调用
-    from kernels.sve_sparse_gemm import load_sve_sparse_gemm_extension
-    load_sve_sparse_gemm_extension()
-    
-    for start, end in sparse_blocks:
-        block_M = end - start
-        # 提取当前 block 的 row_offsets
-        # row_offsets[start] 是第 start 行在 nz_col_indices 中的起始位置
-        offset_start = row_offsets[start].item()
-        offset_end = row_offsets[end].item()
-        
-        # 重建 block 的 row_offsets (0-indexed)
-        block_row_offsets = torch.zeros(block_M + 1, dtype=torch.int64)
-        for i in range(block_M + 1):
-            block_row_offsets[i] = row_offsets[start + i] - offset_start
-        
-        # 提取对应的 nz_col_indices
-        block_nz_col_indices = nz_col_indices[offset_start:offset_end]
-        
-        # 提取 activation block
-        x_block = x[start:end, :]  # (block_M, K)
-        
-        # 调用 sparse GEMM
-        output[start:end, :] = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-            x_block, weight_kn, block_row_offsets, block_nz_col_indices
-        )
-    
-    return output
-
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
@@ -331,21 +165,10 @@ def _new_attn_forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_po
 
     kv_size = self.n_local_heads * self.head_dim
 
-    if USE_CUSTOM_SPARSE_GEMM:
-        # 使用自适应稀疏 GEMM (适用于 prefill 和 decode 阶段)
-        # 处理 wqkv (三个矩阵拼接)
-        qkv = adaptive_sparse_gemm(
-            x.view(-1, self.dim),  # (bsz*seqlen, dim)
-            self.wqkv.weight,
-            self.thresh_q,  # 使用 q 的 threshold (或取平均)
-        )
-        q, k, v = qkv.view(bsz, seqlen, -1).split([self.dim, kv_size, kv_size], dim=-1)
-    elif seqlen == 1:
-        # Decode 阶段: 使用原 GEMV
-        q, k, v = self.gemv1(x, self.wqkv.weight, self.thresh_q, self.thresh_k, self.thresh_v, self.sparsity_bin, kv_size).split([self.dim, kv_size, kv_size], dim=-1)
+    if seqlen > 1:
+        q,k,v = self.gemm1(x, self.wqkv.weight, self.thresh_q, self.thresh_k, self.thresh_v, kv_size).split([self.dim, kv_size, kv_size], dim=-1)
     else:
-        # 回退 baseline
-        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        q,k,v = self.gemv1(x, self.wqkv.weight, self.thresh_q, self.thresh_k, self.thresh_v, kv_size).split([self.dim, kv_size, kv_size], dim=-1)
 
     q = q.view(bsz, seqlen, self.n_head, self.head_dim)
     k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -365,19 +188,10 @@ def _new_attn_forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_po
 
     y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
-    if USE_CUSTOM_SPARSE_GEMM:
-        # 使用自适应稀疏 GEMM (适用于 prefill 和 decode 阶段)
-        y = adaptive_sparse_gemm(
-            y.view(-1, self.dim),
-            self.wo.weight,
-            self.thresh_o,
-        ).view(bsz, seqlen, self.dim)
-    elif seqlen == 1:
-        # Decode 阶段: 使用原 GEMV
-        y = self.gemv2(y, self.wo.weight, self.thresh_o, self.sparsity_bin)
+    if seqlen > 1:
+        y = self.gemm2(y, self.wo.weight, self.thresh_o) # prefill logic taken care of in gemv
     else:
-        # 回退 baseline
-        y = self.wo(y)
+        y = self.gemv2(y, self.wo.weight, self.thresh_o) # prefill logic taken care of in gemv
 
     return y
 
@@ -420,8 +234,6 @@ class Attention(nn.Module):
 
         kv_size = self.n_local_heads * self.head_dim
 
-
-        # q,k,v = self.gemv1(x, self.wqkv.weight, self.thresh_q, self.thresh_k, self.thresh_v, self.sparsity_bin, kv_size).split([self.dim, kv_size, kv_size], dim=-1) # prefill logic taken care of in gemv
         q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1) # baseline
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
@@ -448,28 +260,7 @@ class Attention(nn.Module):
         return y
 
 def _new_ffn_forward(self, x: Tensor) -> Tensor:
-    bsz, seqlen, _ = x.shape
-    
-    if USE_CUSTOM_SPARSE_GEMM:
-        # 使用自适应稀疏 GEMM (适用于 prefill 和 decode 阶段)
-        x_flat = x.view(-1, x.shape[-1])  # (bsz*seqlen, dim)
-        
-        gate = adaptive_sparse_gemm(x_flat, self.w1.weight, self.thresh_gate)
-        up = adaptive_sparse_gemm(x_flat, self.w3.weight, self.thresh_up)
-        hidden = F.silu(gate) * up
-        output = adaptive_sparse_gemm(hidden, self.w2.weight, self.thresh_down)
-        
-        return output.view(bsz, seqlen, -1)
-    elif seqlen == 1:
-        # Decode 阶段: 使用原 GEMV
-        return self.gemv2(
-            F.silu(self.gemv1(x, self.w1.weight, self.thresh_gate, self.sparsity_bin)) * 
-            self.gemv1(x, self.w3.weight, self.thresh_up, self.sparsity_bin), 
-            self.w2.weight, self.thresh_down, self.sparsity_bin
-        )
-    else:
-        # 回退 baseline
-        return self.w2(F.silu(self.w1(x)) * self.w3(x)) 
+    return self.gemv2(F.silu(self.gemv1(x, self.w1.weight, self.thresh_gate)) * self.gemv1(x, self.w3.weight, self.thresh_up), self.w2.weight, self.thresh_down) 
 
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:

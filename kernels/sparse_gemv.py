@@ -1,6 +1,7 @@
 # adapted from deja vu
 
 from typing import Optional
+from kernels.sve_sparse_gemm import PRINT_STATISTICS
 
 import torch
 # import triton
@@ -306,98 +307,12 @@ class SparseQKVGEMV(BaseKernel):
         pass
         # return qkv_gemv(x, weight, threshold_q, threshold_k, threshold_v, sparsity_bin, kv_size) if x.shape[1] == 1 else torch.matmul(x, weight.T)
 
+
+
 # for testing purposes, to see if overhead at 0% is really due to strengthening torch.matmul (seems like it is)
 class DenseGEMV(BaseKernel):
-    # 用于跟踪已打印的形状组合
-    _printed_shapes = set()
-    # 统计总调用次数
-    _total_calls = 0
-    # 统计每种形状的调用次数 {(x_shape, W_shape): count}
-    _shape_call_counts = {}
-    # 分别统计 prefill (seq_len > 1) 和 decode (seq_len == 1)
-    _prefill_calls = 0
-    _decode_calls = 0
-    _prefill_shape_counts = {}  # prefill 阶段每种形状的调用次数
-    _decode_shape_counts = {}   # decode 阶段每种形状的调用次数
-
     def meta(self, x: torch.Tensor, W: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return x.new_empty(x.shape[0], x.shape[1], W.shape[0])
     
     def forward(self, x: torch.Tensor, W: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        # 更新总调用次数
-        DenseGEMV._total_calls += 1
-        
-        shape_key = (tuple(x.shape), tuple(W.shape))
-        seq_len = x.shape[1] if len(x.shape) >= 2 else 1
-        
-        # 判断是 prefill 还是 decode
-        is_prefill = seq_len > 1
-        
-        # 更新形状调用次数
-        if shape_key not in DenseGEMV._shape_call_counts:
-            DenseGEMV._shape_call_counts[shape_key] = 0
-        DenseGEMV._shape_call_counts[shape_key] += 1
-        
-        # 分别统计 prefill 和 decode
-        if is_prefill:
-            DenseGEMV._prefill_calls += 1
-            if shape_key not in DenseGEMV._prefill_shape_counts:
-                DenseGEMV._prefill_shape_counts[shape_key] = 0
-            DenseGEMV._prefill_shape_counts[shape_key] += 1
-        else:
-            DenseGEMV._decode_calls += 1
-            if shape_key not in DenseGEMV._decode_shape_counts:
-                DenseGEMV._decode_shape_counts[shape_key] = 0
-            DenseGEMV._decode_shape_counts[shape_key] += 1
-        
-        # 记录遇到的形状（不打印）
-        DenseGEMV._printed_shapes.add(shape_key)
-        
         return torch.matmul(x, W.T)
-    
-    @classmethod
-    def print_statistics(cls):
-        """打印统计信息"""
-        print(f"\n{'='*80}")
-        print(f"[DenseGEMV Statistics]")
-        print(f"  Total calls: {cls._total_calls}")
-        print(f"    - Prefill (seq_len > 1): {cls._prefill_calls} ({cls._prefill_calls / cls._total_calls * 100:.1f}%)" if cls._total_calls > 0 else "    - Prefill (seq_len > 1): 0")
-        print(f"    - Decode (seq_len == 1): {cls._decode_calls} ({cls._decode_calls / cls._total_calls * 100:.1f}%)" if cls._total_calls > 0 else "    - Decode (seq_len == 1): 0")
-        print(f"  Total unique shapes: {len(cls._printed_shapes)}")
-        
-        if cls._prefill_shape_counts:
-            print(f"\n  Prefill (seq_len > 1) - Shape call counts:")
-            print(f"  {'No.':<5} {'seq_len':<10} {'x.shape':<30} {'W.shape':<30} {'Calls':<10} {'%':<8}")
-            print(f"  {'-'*5} {'-'*10} {'-'*30} {'-'*30} {'-'*10} {'-'*8}")
-            sorted_prefill = sorted(cls._prefill_shape_counts.items(), key=lambda x: x[1], reverse=True)
-            for i, ((x_shape, w_shape), count) in enumerate(sorted_prefill, 1):
-                seq_len = x_shape[1] if len(x_shape) >= 2 else 1
-                percentage = count / cls._prefill_calls * 100 if cls._prefill_calls > 0 else 0
-                print(f"  {i:<5} {seq_len:<10} {str(x_shape):<30} {str(w_shape):<30} {count:<10} {percentage:>6.1f}%")
-            print(f"  {'='*5} {'='*10} {'='*30} {'='*30} {'='*10} {'='*8}")
-            print(f"  Total prefill calls: {cls._prefill_calls}")
-        
-        if cls._decode_shape_counts:
-            print(f"\n  Decode (seq_len == 1) - Shape call counts:")
-            print(f"  {'No.':<5} {'x.shape':<30} {'W.shape':<30} {'Calls':<10} {'%':<8}")
-            print(f"  {'-'*5} {'-'*30} {'-'*30} {'-'*10} {'-'*8}")
-            sorted_decode = sorted(cls._decode_shape_counts.items(), key=lambda x: x[1], reverse=True)
-            for i, ((x_shape, w_shape), count) in enumerate(sorted_decode, 1):
-                percentage = count / cls._decode_calls * 100 if cls._decode_calls > 0 else 0
-                print(f"  {i:<5} {str(x_shape):<30} {str(w_shape):<30} {count:<10} {percentage:>6.1f}%")
-            print(f"  {'='*5} {'='*30} {'='*30} {'='*10} {'='*8}")
-            print(f"  Total decode calls: {cls._decode_calls}")
-        
-        print(f"{'='*80}\n")
-    
-    @classmethod
-    def reset_statistics(cls):
-        """重置统计信息"""
-        cls._printed_shapes.clear()
-        cls._total_calls = 0
-        cls._shape_call_counts.clear()
-        cls._prefill_calls = 0
-        cls._decode_calls = 0
-        cls._prefill_shape_counts.clear()
-        cls._decode_shape_counts.clear()
-        print("[DenseGEMV] Statistics reset.")

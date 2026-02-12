@@ -14,13 +14,13 @@
  *
  * Input:
  *   - activation: (M, K) float32 contiguous CPU
- *   - weight: (B, K, N) or (K, N) float32 contiguous CPU
+ *   - weight: (K, N) float32 contiguous CPU
  *   - row_offsets: 1D int64 length=M+1 (CSR row pointers)
  *   - nz_col_indices: 1D uint32 length=nnz (CSR column indices)
  *
  * Computation:
- *   For each batch b, row i and its non-zeros (k, a):
- *     out[b, i, :] += a * weight[b, k, :]
+ *   For each row i and its non-zeros (k, a):
+ *     out[i, :] += a * weight[k, :]
  */
 
 namespace {
@@ -41,7 +41,7 @@ void check_inputs_icsr_gemm(
   TORCH_CHECK(nz_col_indices.dtype() == torch::kUInt32, "nz_col_indices must be uint32");
 
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D");
-  TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3, "weight must be 2D or 3D");
+  TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
   TORCH_CHECK(row_offsets.dim() == 1, "row_offsets must be 1D");
   TORCH_CHECK(nz_col_indices.dim() == 1, "nz_col_indices must be 1D");
 
@@ -52,13 +52,13 @@ void check_inputs_icsr_gemm(
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
-  const int64_t weight_K = weight.dim() == 2 ? weight.size(0) : weight.size(1);
+  const int64_t weight_K = weight.size(0);
   TORCH_CHECK(weight_K == K, "weight K dimension must match activation K");
   TORCH_CHECK(row_offsets.size(0) == M + 1, "row_offsets length must be M+1");
-    TORCH_CHECK(row_offsets.data_ptr<int64_t>()[0] == 0, "row_offsets[0] must be 0");
-    TORCH_CHECK(row_offsets.data_ptr<int64_t>()[M] == nz_col_indices.numel(), 
-                "row_offsets[M] must equal nz_col_indices size");
-  }
+  TORCH_CHECK(row_offsets.data_ptr<int64_t>()[0] == 0, "row_offsets[0] must be 0");
+  TORCH_CHECK(row_offsets.data_ptr<int64_t>()[M] == nz_col_indices.numel(), 
+              "row_offsets[M] must equal nz_col_indices size");
+}
 } // namespace
 
 torch::Tensor sparse_gemm_icsr(
@@ -70,11 +70,9 @@ torch::Tensor sparse_gemm_icsr(
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
-  const bool is_3d = weight.dim() == 3;
-  const int64_t B = is_3d ? weight.size(0) : 1;
-  const int64_t N = is_3d ? weight.size(2) : weight.size(1);
+  const int64_t N = weight.size(1);
 
-  auto output = is_3d ? torch::zeros({B, M, N}, activation.options()) : torch::zeros({M, N}, activation.options());
+  auto output = torch::zeros({M, N}, activation.options());
   if (M == 0 || K == 0 || N == 0) {
     return output;
   }
@@ -87,17 +85,12 @@ torch::Tensor sparse_gemm_icsr(
 
   const int64_t n_block_sz = N/16;
   const int64_t n_block = (N + n_block_sz - 1) / n_block_sz;
-  
-  // Process each batch
-  for (int64_t b = 0; b < B; ++b) {
-    const float* batch_weight_ptr = is_3d ? (weight_ptr + b * K * N) : weight_ptr;
-    float* batch_out_ptr = is_3d ? (out_ptr + b * M * N) : out_ptr;
 
-    // 2D parallelization: each thread handles one (m, nb) tile.
-    // Use local accumulator per tile then single write to reduce rounding error (match SVE gather behavior).
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int64_t m = 0; m < M; ++m) {
-      for (int64_t nb = 0; nb < n_block; ++nb) {
+  // 2D parallelization: each thread handles one (m, nb) tile.
+  // Use local accumulator per tile then single write to reduce rounding error (match SVE gather behavior).
+  #pragma omp parallel for collapse(2) schedule(static)
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t nb = 0; nb < n_block; ++nb) {
       const int64_t p0 = row_offsets_ptr[m];
       const int64_t p1 = row_offsets_ptr[m + 1];
       if (p0 == p1) continue;
@@ -110,39 +103,39 @@ torch::Tensor sparse_gemm_icsr(
       const float* act_row_ptr = act_ptr + m * K;
       std::vector<float> acc(block_len, 0.0f);
       
-      #if defined(__ARM_FEATURE_SVE)
-        // SVE path: accumulate into local buffer, then single write
-        for (int64_t p = p0; p < p1; ++p) {
-          const uint32_t k = indices_ptr[p];
-          const float a = act_row_ptr[(int64_t)k];
-          const float* w_row = weight_ptr + (int64_t)k * N;
-          int64_t n = 0;
-          for (; n < block_len; ) {
-            svbool_t pg = svwhilelt_b32(n, block_len);
-            svfloat32_t accv = svld1_f32(pg, acc.data() + n);
-            svfloat32_t wv = svld1_f32(pg, w_row + n0 + n);
-            svfloat32_t rv = svmla_n_f32_m(pg, accv, wv, a);
-            svst1_f32(pg, acc.data() + n, rv);
-            n += svcntw();
-          }
+#if defined(__ARM_FEATURE_SVE)
+      // SVE path: accumulate into local buffer, then single write
+      for (int64_t p = p0; p < p1; ++p) {
+        const uint32_t k = indices_ptr[p];
+        const float a = act_row_ptr[(int64_t)k];
+        const float* w_row = weight_ptr + (int64_t)k * N;
+        int64_t n = 0;
+        for (; n < block_len; ) {
+          svbool_t pg = svwhilelt_b32(n, block_len);
+          svfloat32_t accv = svld1_f32(pg, acc.data() + n);
+          svfloat32_t wv = svld1_f32(pg, w_row + n0 + n);
+          svfloat32_t rv = svmla_n_f32_m(pg, accv, wv, a);
+          svst1_f32(pg, acc.data() + n, rv);
+          n += svcntw();
         }
+      }
+      for (int64_t r = 0; r < block_len; ++r) {
+        out_row[n0 + r] = acc[r];
+      }
+#else
+      // Scalar path: accumulate into local buffer, then single write
+      for (int64_t p = p0; p < p1; ++p) {
+        const uint32_t k = indices_ptr[p];
+        const float a = act_row_ptr[(int64_t)k];
+        const float* w_row = weight_ptr + (int64_t)k * N;
         for (int64_t r = 0; r < block_len; ++r) {
-          out_row[n0 + r] = acc[r];
+          acc[r] += a * w_row[n0 + r];
         }
-      #else
-        // Scalar path: accumulate into local buffer, then single write
-        for (int64_t p = p0; p < p1; ++p) {
-          const uint32_t k = indices_ptr[p];
-          const float a = act_row_ptr[(int64_t)k];
-          const float* w_row = weight_ptr + (int64_t)k * N;
-          for (int64_t r = 0; r < block_len; ++r) {
-            acc[r] += a * w_row[n0 + r];
-          }
-        }
-        for (int64_t r = 0; r < block_len; ++r) {
-          out_row[n0 + r] = acc[r];
-        }
-      #endif
+      }
+      for (int64_t r = 0; r < block_len; ++r) {
+        out_row[n0 + r] = acc[r];
+      }
+#endif
     }
   }
   return output;

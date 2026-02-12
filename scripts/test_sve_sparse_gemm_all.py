@@ -4,7 +4,7 @@ Comprehensive test script for ARM SVE sparse GEMM operators.
 This script tests combinations of sparsify and GEMM operators for different sparse formats (17 in total):
 
 Custom SVE operators (13):
-- iCSR: thr_sparsify_to_icsr(_sve) + sparse_gemm_icsr(_sve_gather)
+- iCSR: thr_sparsify_to_icsr / thr_sparsify_to_icsr_sve / thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr(_sve_gather)
 - CSR: thr_sparsify_to_csr(_sve) + sparse_gemm_csr(_sve_gather)
 - COO: thr_sparsify_to_coo(_sve) + sparse_gemm_coo(_sve_gather)
 - CSC: thr_sparsify_to_csc + sparse_gemm_csc
@@ -39,6 +39,7 @@ from kernels.cpp_sve_sparse_gemm import (
     SparseGEMMICSRKernel,
     thr_sparsify_to_icsr,
     thr_sparsify_to_icsr_sve,
+    thr_sparsify_to_icsr_sve_baseline,
     # CSR operators
     SparseGEMMCSRKernel,
     SparseGEMMCSRSVEGatherKernel,
@@ -418,7 +419,7 @@ def test_preprocess_only(
     print(f"  Latency: {lat:.4f} ms")
 
     # Custom: iCSR sparsify
-    print("\n[Preprocess-only][iCSR] thr_sparsify_to_icsr / thr_sparsify_to_icsr_sve")
+    print("\n[Preprocess-only][iCSR] thr_sparsify_to_icsr / thr_sparsify_to_icsr_sve / thr_sparsify_to_icsr_sve_baseline")
     def icsr_pre_1():
         return thr_sparsify_to_icsr(activation, threshold)
 
@@ -432,6 +433,13 @@ def test_preprocess_only(
     lat = measure_latency(icsr_pre_2, warmup=5, iters=100000)
     results["Preprocess-only: iCSR thr_sparsify_to_icsr_sve"] = (icsr_pre_2(), lat)
     print(f"  - thr_sparsify_to_icsr_sve: Latency {lat:.4f} ms")
+
+    def icsr_pre_baseline():
+        return thr_sparsify_to_icsr_sve_baseline(activation, threshold)
+
+    lat = measure_latency(icsr_pre_baseline, warmup=5, iters=100000)
+    results["Preprocess-only: iCSR thr_sparsify_to_icsr_sve_baseline"] = (icsr_pre_baseline(), lat)
+    print(f"  - thr_sparsify_to_icsr_sve_baseline: Latency {lat:.4f} ms")
 
     # Custom: CSR sparsify
     print("\n[Preprocess-only][CSR] thr_sparsify_to_csr / thr_sparsify_to_csr_sve")
@@ -494,6 +502,8 @@ def test_icsr_combinations(
     - thr_sparsify_to_icsr_sve + sparse_gemm_icsr_sve_gather
     - thr_sparsify_to_icsr + sparse_gemm_icsr
     - thr_sparsify_to_icsr_sve + sparse_gemm_icsr
+    - thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr_sve_gather
+    - thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr
 
     Returns:
         Dict[combo_name, (result, latency)]
@@ -558,6 +568,28 @@ def test_icsr_combinations(
     result4 = icsr_combo4()
     results["iCSR-4: thr_sparsify_to_icsr_sve + sparse_gemm_icsr"] = (result4, lat4)
     print(f"  Latency: {lat4:.4f} ms")
+
+    # Combo 5: thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr_sve_gather
+    print("\n[iCSR-5] thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr_sve_gather")
+    def icsr_combo5():
+        nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve_baseline(activation, threshold)
+        return icsr_sve_gather_op(activation, weight, row_offsets, nz_col_indices)
+    
+    lat5 = measure_latency(icsr_combo5, warmup=5, iters=100000)
+    result5 = icsr_combo5()
+    results["iCSR-5: thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr_sve_gather"] = (result5, lat5)
+    print(f"  Latency: {lat5:.4f} ms")
+
+    # Combo 6: thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr
+    print("\n[iCSR-6] thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr")
+    def icsr_combo6():
+        nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve_baseline(activation, threshold)
+        return icsr_op(activation, weight, row_offsets, nz_col_indices)
+    
+    lat6 = measure_latency(icsr_combo6, warmup=5, iters=100000)
+    result6 = icsr_combo6()
+    results["iCSR-6: thr_sparsify_to_icsr_sve_baseline + sparse_gemm_icsr"] = (result6, lat6)
+    print(f"  Latency: {lat6:.4f} ms")
 
     return results
 

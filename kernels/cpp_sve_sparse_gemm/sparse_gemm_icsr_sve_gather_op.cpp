@@ -39,7 +39,7 @@ void check_sparse_gemv_icsr_sve_gather_inputs(
   TORCH_CHECK(nz_col_index.dtype() == torch::kUInt32, "nz_col_index must be uint32");
 
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D");
-  TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3, "weight must be 2D or 3D");
+  TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
   TORCH_CHECK(nz_col_index.dim() == 1, "nz_col_index must be 1D");
 
   TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
@@ -48,7 +48,7 @@ void check_sparse_gemv_icsr_sve_gather_inputs(
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
-  const int64_t weight_K = weight.dim() == 2 ? weight.size(0) : weight.size(1);
+  const int64_t weight_K = weight.size(0);
   TORCH_CHECK(weight_K == K, "weight K dimension must match activation K");
 
   TORCH_CHECK(nz_row >= 0 && nz_row < M, "nz_row out of range");
@@ -85,7 +85,7 @@ torch::Tensor sparse_gemv_icsr_sve_gather(
     const uint32_t N_u32 = static_cast<uint32_t>(N);
 
     // N-dimension blocking (aligned with sparse_gemm_icsr_sve_gather's n_block_sz idea)
-    int64_t n_block_sz = N / 16;
+    int64_t n_block_sz = std::min(N / 16,(int64_t)1);
     const int64_t n_full = (N / n_block_sz) * n_block_sz;
     const int64_t rem = N - n_full;
 
@@ -177,7 +177,7 @@ void check_sparse_gemm_icsr_sve_gather_inputs(
   TORCH_CHECK(nz_col_indices.dtype() == torch::kUInt32, "nz_col_indices must be uint32");
 
   TORCH_CHECK(activation.dim() == 2, "activation must be 2D");
-  TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3, "weight must be 2D or 3D");
+  TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
   TORCH_CHECK(row_offsets.dim() == 1, "row_offsets must be 1D");
   TORCH_CHECK(nz_col_indices.dim() == 1, "nz_col_indices must be 1D");
 
@@ -188,7 +188,7 @@ void check_sparse_gemm_icsr_sve_gather_inputs(
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
-  const int64_t weight_K = weight.dim() == 2 ? weight.size(0) : weight.size(1);
+  const int64_t weight_K = weight.size(0);
   TORCH_CHECK(weight_K == K, "weight K dimension must match activation K");
   TORCH_CHECK(row_offsets.size(0) == M + 1, "row_offsets length must be M+1");
   
@@ -207,11 +207,9 @@ torch::Tensor sparse_gemm_icsr_sve_gather(
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
-  const bool is_3d = weight.dim() == 3;
-  const int64_t B = is_3d ? weight.size(0) : 1;
-  const auto N = is_3d ? weight.size(2) : weight.size(1);
+  const auto N = weight.size(1);
 
-  auto output = is_3d ? torch::zeros({B, M, N}, activation.options()) : torch::zeros({M, N}, activation.options());
+  auto output = torch::zeros({M, N}, activation.options());
   
   if (M == 0 || N == 0 || K == 0) {
     return output;
@@ -223,104 +221,103 @@ torch::Tensor sparse_gemm_icsr_sve_gather(
   const uint32_t* indices_ptr = nz_col_indices.data_ptr<uint32_t>();
   float* out_ptr = output.data_ptr<float>();
 
-  // Process each batch
-  for (int64_t b = 0; b < B; ++b) {
-    const float* batch_weight_ptr = is_3d ? (weight_ptr + b * K * N) : weight_ptr;
-    float* batch_out_ptr = is_3d ? (out_ptr + b * M * N) : out_ptr;
-
 #if defined(__ARM_FEATURE_SVE)
   const int64_t vl = svcntw();
   const uint32_t N_u32 = (uint32_t)N;
   
-    int64_t n_block_sz = N/16;
-    const int64_t n_full = (N / n_block_sz) * n_block_sz;
-    const int64_t rem = N - n_full;
+  int64_t n_block_sz = N/16;
+  const int64_t n_full = (N / n_block_sz) * n_block_sz;
+  const int64_t rem = N - n_full;
 
-    #pragma omp parallel
-    {
-      #pragma omp for collapse(2) schedule(static)
-      for (int64_t m = 0; m < M; ++m) {
-        for (int64_t n = 0; n < n_full; n += n_block_sz) {
-          const int64_t p0 = offsets_ptr[m];
-          const int64_t p1 = offsets_ptr[m + 1];
-          const int64_t nnz = p1 - p0;
-          if (nnz == 0) continue;
+  #pragma omp parallel
+  {
+    #pragma omp for collapse(2) schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t n = 0; n < n_full; n += n_block_sz) {
+        const int64_t p0 = offsets_ptr[m];
+        const int64_t p1 = offsets_ptr[m + 1];
+        const int64_t nnz = p1 - p0;
+        if (nnz == 0) continue;
 
-          const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + p0;
-          float* out_row_ptr = out_ptr + m * N;
-          std::vector<float> acc(n_block_sz, 0.0f);
-          const float* base = weight_ptr + n;
+        const float* act_row_ptr = act_ptr + m * K;
+        const uint32_t* idx_ptr = indices_ptr + p0;
+        float* out_row_ptr = out_ptr + m * N;
+        std::vector<float> acc(n_block_sz, 0.0f);
+        const float* base = weight_ptr + n;
 
-          for (int64_t i = 0; i < nnz; i += vl) {
-            const svbool_t pg = svwhilelt_b32(i, nnz);
-            
-            // Gather load activation non-zeros
-            const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
-            const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
-            
-            // Compute weight indices
-            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
-
-            // Gather load weight
-            for(int64_t r = 0; r < n_block_sz; r++) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
-              acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
-            }
-          }
-
-          for(int64_t r = 0; r < n_block_sz; r++) {
-            out_row_ptr[n + r] += acc[r];
-          }
-        } 
-      } 
-
-      if (rem > 0) {
-        #pragma omp for schedule(static)
-        for (int64_t m = 0; m < M; ++m) {
-          const int64_t nnz = offsets_ptr[m + 1] - offsets_ptr[m];
-          if (nnz == 0) continue;
-
-          const float* act_row_ptr = act_ptr + m * K;
-          const uint32_t* idx_ptr = indices_ptr + offsets_ptr[m];
-          float* out_row_ptr = out_ptr + m * N;
-
-          const int64_t n_start = n_full;
+        for (int64_t i = 0; i < nnz; i += vl) {
+          const svbool_t pg = svwhilelt_b32(i, nnz);
           
-          std::vector<float> acc(rem, 0.0f);
+          // Gather load activation non-zeros
+          const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
+          const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
+          
+          // Compute weight indices
+          const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
 
-          for (int64_t i = 0; i < nnz; i += vl) {
-            const svbool_t pg = svwhilelt_b32(i, nnz);
-            const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
-            const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
-            const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
-
-            for (int64_t r = 0; r < rem; ++r) {
-              const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, weight_ptr + (n_start + r), w_index);
-              acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
-            }
+          // Gather load weight
+          for(int64_t r = 0; r < n_block_sz; r++) {
+            const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, base + r, w_index);
+            acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
           }
+        }
+
+        for(int64_t r = 0; r < n_block_sz; r++) {
+          out_row_ptr[n + r] += acc[r];
+        }
+      } 
+    } 
+
+    if (rem > 0) {
+      #pragma omp for schedule(static)
+      for (int64_t m = 0; m < M; ++m) {
+        const int64_t nnz = offsets_ptr[m + 1] - offsets_ptr[m];
+        if (nnz == 0) continue;
+
+        const float* act_row_ptr = act_ptr + m * K;
+        const uint32_t* idx_ptr = indices_ptr + offsets_ptr[m];
+        float* out_row_ptr = out_ptr + m * N;
+
+        const int64_t n_start = n_full;
+        
+        std::vector<float> acc(rem, 0.0f);
+
+        for (int64_t i = 0; i < nnz; i += vl) {
+          const svbool_t pg = svwhilelt_b32(i, nnz);
+          const svuint32_t idx = svld1_u32(pg, idx_ptr + i);
+          const svfloat32_t act_vals = svld1_gather_u32index_f32(pg, act_row_ptr, idx);
+          const svuint32_t w_index = svmul_n_u32_x(pg, idx, N_u32);
 
           for (int64_t r = 0; r < rem; ++r) {
-            out_row_ptr[n_start + r] += acc[r];
+            const svfloat32_t w_vals = svld1_gather_u32index_f32(pg, weight_ptr + (n_start + r), w_index);
+            acc[r] += svaddv_f32(pg, svmul_f32_m(pg, act_vals, w_vals));
           }
         }
-      }
-    }
-#else
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int64_t m = 0; m < M; ++m) {
-      for (int64_t n = 0; n < N; ++n) {
-        out_ptr[m * N + n] = 0.0f;
-        for (int64_t i = 0; i < nnz; ++i) {
-          const uint32_t k = indices_ptr[i];
-          const float a = act_ptr[m * K + k];
-          if (a == 0.0f) continue;
-          const float* w_row = weight_ptr + k * N;
-          out_ptr[m * N + n] += a * w_row[n];
+
+        for (int64_t r = 0; r < rem; ++r) {
+          out_row_ptr[n_start + r] += acc[r];
         }
       }
     }
+  }
+#else
+  #pragma omp parallel for schedule(static)
+  for (int64_t m = 0; m < M; ++m) {
+    const int64_t p0 = offsets_ptr[m];
+    const int64_t p1 = offsets_ptr[m + 1];
+    float* out_row = out_ptr + m * N;
+    const float* act_row_ptr = act_ptr + m * K;
+    
+    for (int64_t p = p0; p < p1; ++p) {
+      const uint32_t k = indices_ptr[p];
+      const float a = act_row_ptr[k];
+      if (a == 0.0f) continue;
+      const float* w_row = weight_ptr + k * N;
+      for (int64_t n = 0; n < N; ++n) {
+        out_row[n] += a * w_row[n];
+      }
+    }
+  }
 #endif
   return output;
 }

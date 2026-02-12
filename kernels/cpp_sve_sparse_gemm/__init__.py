@@ -1,4 +1,4 @@
-from kernels.sve_sparse_gemm import (  # noqa: F401
+from ..sve_sparse_gemm import (  # noqa: F401
     # extension loader / utils
     load_sve_sparse_gemm_extension,
     measure_latency,

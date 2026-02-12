@@ -40,12 +40,12 @@ static inline void check_thr_sparsify_to_icsr_inputs(const torch::Tensor& activa
  *   threshold: float threshold, elements with abs(x) >= threshold are kept
  *
  * Returns:
- *   nz_counts: int64 [2*M] placeholder / non-zero count info
+ *   nz_counts: int64 [M]; nz_counts[0..M-1] = per-row nnz (used for row_offsets)
  *   nz_col_indices: uint32 [nnz] column index array
- *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum)
+ *   row_offsets: int64 [M+1] CSR row pointer array (prefix sum of nz_counts[0..M-1])
  *
  * Implementation strategy:
- *   Pass 1: Count nnz per row (parallel)
+ *   Pass 1: Count nnz per row into nz_counts[0..M-1] (parallel)
  *   Pass 2: Build row_offsets (prefix sum), then fill nz_col_indices by row
  */
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
@@ -57,55 +57,30 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
   const float thr = static_cast<float>(threshold);
   const float* act = activation.data_ptr<float>();
 
-  // Per-row nnz counts (int64, for prefix sum)
-  auto row_nnz_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* row_nnz = row_nnz_t.data_ptr<int64_t>();
+  // nz_counts_t: M, per-row nnz (used for row_offsets prefix sum)
+  auto nz_counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  int64_t* nz_counts = nz_counts_t.data_ptr<int64_t>();
 
-  // ---------------- Pass 1: Count nnz per row (parallel) ----------------
+  // ---------------- Pass 1: Count nnz per row into nz_counts[0..M-1] (parallel) ----------------
   #pragma omp parallel for schedule(static)
   for (int64_t m = 0; m < M; ++m) {
     const float* row_ptr = act + m * K;
     int64_t nnz = 0;
-
-    // Help auto-vectorization: simple loop + simd reduction.
 #pragma omp simd reduction(+:nnz)
     for (int64_t k = 0; k < K; ++k) {
       const float ax = abs_f32_fast(row_ptr[k]);
       nnz += (ax >= thr);
     }
-
-    row_nnz[m] = nnz;
+    nz_counts[m] = nnz;
   }
 
-  // ---------------- Build row_offsets (prefix sum, int64 [M+1]) ----------------
+  // ---------------- Build row_offsets (prefix sum over nz_counts[0..M-1]) ----------------
   std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
-    row_offsets[m + 1] = row_offsets[m] + row_nnz[m];
+    row_offsets[m + 1] = row_offsets[m] + nz_counts[m];
   }
   const int64_t total_nnz = row_offsets[M];
-
-  // // --------------- Build nz_counts (sparse pairs [row, nnz]) ---------------
-  // // Only rows with nnz>0 are recorded, so nz_counts length is even but not necessarily 2*M.
-  // int64_t num_nz_rows = 0;
-  // for (int64_t m = 0; m < M; ++m) {
-  //   if (row_nnz[m] > 0) num_nz_rows++;
-  // }
-
-  // auto nz_counts_t = torch::empty({2 * num_nz_rows}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  auto nz_counts_t = torch::empty({2 * M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  // int64_t* nz_counts = nz_counts_t.data_ptr<int64_t>();
-
-  // {
-  //   int64_t w = 0;
-  //   for (int64_t m = 0; m < M; ++m) {
-  //     const int64_t nnz = row_nnz[m];
-  //     if (nnz > 0) {
-  //       nz_counts[w++] = m;
-  //       nz_counts[w++] = nnz;
-  //     }
-  //   }
-  // }
 
   // ---------------- Allocate nz_col_indices (flattened, uint32) ----------------
   auto nz_col_indices_t = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
@@ -114,7 +89,7 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
   // ---------------- Pass 2: Fill nz_col_indices by row (parallel, no atomics) ----------------
   #pragma omp parallel for schedule(static)
   for (int64_t m = 0; m < M; ++m) {
-    const int64_t nnz = row_nnz[m];
+    const int64_t nnz = nz_counts[m];
     if (nnz == 0) continue;
 
     const float* row_ptr = act + m * K;
@@ -185,7 +160,7 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
     }
 
 #ifndef NDEBUG
-    // Debug correctness: ensure written count matches row_nnz
+    // Debug correctness: ensure written count matches nz_counts[m]
     TORCH_CHECK(write_pos == nnz,
                 "RowScan mismatch at row ", m,
                 ": wrote ", write_pos, " expected ", nnz);

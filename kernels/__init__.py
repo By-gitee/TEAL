@@ -1,13 +1,13 @@
 from kernels.sve_sparse_gemm import (
-    SVESparseGEMVKernel,
-    SVESparseGEMMKernel,
     load_sve_sparse_gemm_extension,
     measure_latency,
+    SparseGEMViCSRSVEGatherKernel,
+    SparseGEMMiCSRSVEGatherKernel,
 )
 
 __all__ = [
-    "SVESparseGEMVKernel",
-    "SVESparseGEMMKernel",
     "load_sve_sparse_gemm_extension",
     "measure_latency",
+    "SparseGEMViCSRSVEGatherKernel",
+    "SparseGEMMiCSRSVEGatherKernel",
 ]
