@@ -166,9 +166,9 @@ def _new_attn_forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_po
     kv_size = self.n_local_heads * self.head_dim
 
     if seqlen > 1:
-        q,k,v = self.gemm1(x, self.wqkv.weight, self.thresh_q, self.thresh_k, self.thresh_v, kv_size).split([self.dim, kv_size, kv_size], dim=-1)
+        q,k,v = self.gemm1(x, self.wq, self.wk, self.wv, self.thresh_q, self.thresh_k, self.thresh_v).split([self.dim, kv_size, kv_size], dim=-1)
     else:
-        q,k,v = self.gemv1(x, self.wqkv.weight, self.thresh_q, self.thresh_k, self.thresh_v, kv_size).split([self.dim, kv_size, kv_size], dim=-1)
+        q,k,v = self.gemv1(x, self.wq, self.wk, self.wv, self.thresh_q, self.thresh_k, self.thresh_v).split([self.dim, kv_size, kv_size], dim=-1)
 
     q = q.view(bsz, seqlen, self.n_head, self.head_dim)
     k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)

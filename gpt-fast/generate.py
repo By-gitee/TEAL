@@ -341,7 +341,15 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.attention.thresh_k = sparses["k"]
         layer.attention.thresh_v = sparses["v"]
         layer.attention.sparsity_bin = 0
-        layer.attention.wqkv.weight.data = layer.attention.wqkv.weight.data.T.contiguous() # column major
+        
+        kv_size = layer.attention.n_local_heads * layer.attention.head_dim
+        N_k = kv_size
+        N_v = kv_size
+        N_q = layer.attention.wqkv.weight.data.size(0) - 2 * kv_size
+        layer.attention.wq,layer.attention.wk,layer.attention.wv = layer.attention.wqkv.weight.data.split([N_q, N_k, N_v], dim=0)
+        layer.attention.wq = layer.attention.wq.T.contiguous()
+        layer.attention.wk = layer.attention.wk.T.contiguous()
+        layer.attention.wv = layer.attention.wv.T.contiguous()
 
         layer.attention.gemm2_kernel = LNSparseGEMMiCSRSVEGatherKernel.initialize("ln_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
         layer.attention.gemm2 = layer.attention.gemm2_kernel.operator(False)
@@ -581,9 +589,9 @@ def main(
             )
 
             # 打印统计
-        from kernels.sparse_gemv import DenseGEMV
+        from kernels.sve_sparse_gemm import DenseBaseGEMV
         if hist_path is not None:  # 只在使用 monkeypatch 时打印
-            DenseGEMV.print_statistics()
+            DenseBaseGEMV.print_statistics()
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")

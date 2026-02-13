@@ -147,35 +147,33 @@ class QKVSparseGEMViCSRSVEGatherKernel(BaseKernel):
     def meta(
         self,
         activation: torch.Tensor,
-        weight: torch.Tensor,
+        weight_q: torch.Tensor,
+        weight_k: torch.Tensor,
+        weight_v: torch.Tensor,
         threshold_q: float,
         threshold_k: float,
         threshold_v: float,
-        kv_size: int
     ) -> torch.Tensor:
-        return activation.new_empty((activation.size(0), activation.size(1), weight.size(1)))
+        N = weight_q.size(1) + weight_k.size(1) + weight_v.size(1)
+        return activation.new_empty((activation.size(0), activation.size(1), N))
 
     def forward(
         self,
         activation: torch.Tensor,
-        weight: torch.Tensor,
+        weight_q: torch.Tensor,
+        weight_k: torch.Tensor,
+        weight_v: torch.Tensor,
         threshold_q: float,
         threshold_k: float,
         threshold_v: float,
-        kv_size: int
     ) -> torch.Tensor:
         B, S, K = activation.shape
-        N = weight.size(1)
+        N_q = weight_q.size(1)
+        N_k = weight_k.size(1)
+        N_v = weight_v.size(1)
+        N = N_q + N_k + N_v
+        
         act_2d = activation.view(-1, K)
-        
-        # 分割 weight 为 Q, K, V 三部分
-        N_q = N - 2 * kv_size
-        N_k = kv_size
-        N_v = kv_size
-        
-        weight_q = weight[:, :N_q]
-        weight_k = weight[:, N_q:N_q + N_k]
-        weight_v = weight[:, N_q + N_k:]
         
         # 分别处理 Q, K, V
         # Q 部分
@@ -217,37 +215,34 @@ class QKVSparseGEMMiCSRSVEGatherKernel(BaseKernel):
     def meta(
         self,
         activation: torch.Tensor,
-        weight: torch.Tensor,
+        weight_q: torch.Tensor,
+        weight_k: torch.Tensor,
+        weight_v: torch.Tensor,
         threshold_q: float,
         threshold_k: float,
         threshold_v: float,
-        kv_size: int
     ) -> torch.Tensor:
-        return activation.new_empty((activation.size(0), activation.size(1), weight.size(1)))
+        N = weight_q.size(1) + weight_k.size(1) + weight_v.size(1)
+        return activation.new_empty((activation.size(0), activation.size(1), N))
 
     def forward(
         self,
         activation: torch.Tensor,
-        weight: torch.Tensor,
+        weight_q: torch.Tensor,
+        weight_k: torch.Tensor,
+        weight_v: torch.Tensor,
         threshold_q: float,
         threshold_k: float,
         threshold_v: float,
-        kv_size: int
     ) -> torch.Tensor:
-        load_sve_sparse_gemm_extension()
         B, S, K = activation.shape
-        N = weight.size(1)
+        N_q = weight_q.size(1)
+        N_k = weight_k.size(1)
+        N_v = weight_v.size(1)
+        N = N_q + N_k + N_v
+        
         act_2d = activation.view(-1, K)
         BM = act_2d.shape[0]
-        
-        # 分割 weight 为 Q, K, V 三部分
-        N_q = N - 2 * kv_size
-        N_k = kv_size
-        N_v = kv_size
-        
-        weight_q = weight[:, :N_q]
-        weight_k = weight[:, N_q:N_q + N_k]
-        weight_v = weight[:, N_q + N_k:]
         
         # 处理 Q 部分（使用 threshold_q）
         nz_counts_q, nz_col_indices_q, row_offsets_q = thr_sparsify_to_icsr_sve(act_2d, threshold_q)
@@ -359,7 +354,7 @@ class LNSparseGEMViCSRSVEGatherKernel(BaseKernel):
         if sparsity < DENSE_THRESHOLD:
             # TODO: check use torch.matmul or my own gemm
             # TODO: shape matters
-            return torch.matmul(x, weight)
+            out = torch.matmul(x, weight)
         else:
             out = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
                 x, weight, row_offsets, nz_col_indices
@@ -779,7 +774,7 @@ class DenseBaseGEMV(BaseKernel):
             
             # 记录遇到的形状（不打印）
             DenseBaseGEMV._printed_shapes.add(shape_key)
-        
+        print("DenseBaseGEMV:x.shape=",x.shape, "||W.shape=", W.shape)
         return torch.matmul(x, W)
     
     @classmethod
@@ -867,6 +862,7 @@ class DenseBaseGEMM(BaseKernel):
             # 记录遇到的形状（不打印）
             DenseBaseGEMM._printed_shapes.add(shape_key)
         
+        print("DenseBaseGEMV:x.shape=",x.shape, "||W.shape=", W.shape)
         return torch.matmul(x, W)
     
     @classmethod
