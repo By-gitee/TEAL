@@ -172,34 +172,51 @@ class QKVSparseGEMViCSRSVEGatherKernel(BaseKernel):
         N_k = weight_k.size(1)
         N_v = weight_v.size(1)
         N = N_q + N_k + N_v
-        
-        act_2d = activation.view(-1, K)
-        
-        # 分别处理 Q, K, V
-        # Q 部分
-        nz_counts_q, nz_col_indices_q, row_offsets_q = torch.ops.sparse_op.thr_sparsify_to_icsr(
-            act_2d, float(threshold_q)
-        )
-        out_q = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-            act_2d, weight_q, row_offsets_q, nz_col_indices_q
-        )
-        
-        # K 部分
-        nz_counts_k, nz_col_indices_k, row_offsets_k = torch.ops.sparse_op.thr_sparsify_to_icsr(
-            act_2d, float(threshold_k)
-        )
-        out_k = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-            act_2d, weight_k, row_offsets_k, nz_col_indices_k
-        )
-        
-        # V 部分
-        nz_counts_v, nz_col_indices_v, row_offsets_v = torch.ops.sparse_op.thr_sparsify_to_icsr(
-            act_2d, float(threshold_v)
-        )
-        out_v = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-            act_2d, weight_v, row_offsets_v, nz_col_indices_v
-        )
-        
+        if (K,N_q) not in [(4096,4096)]:
+            out_q = torch.matmul(activation, weight_q)
+            out_k = torch.matmul(activation, weight_k)
+            out_v = torch.matmul(activation, weight_v)
+            return torch.cat([out_q, out_k, out_v], dim=1).view(B, S, N)
+        else:
+            act_2d = activation.view(-1, K)
+            
+            # 分别处理 Q, K, V
+            # Q 部分
+            nz_counts_q, nz_col_indices_q, row_offsets_q = torch.ops.sparse_op.thr_sparsify_to_icsr(
+                act_2d, float(threshold_q)
+            )
+            sparsity_q = 1.0 - (nz_counts_q.float() / K)
+            if sparsity_q > DENSE_THRESHOLD:
+                out_q = torch.matmul(act_2d, weight_q)
+            else:
+                out_q = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                    act_2d, weight_q, row_offsets_q, nz_col_indices_q
+                )
+            
+            # K 部分
+            nz_counts_k, nz_col_indices_k, row_offsets_k = torch.ops.sparse_op.thr_sparsify_to_icsr(
+                act_2d, float(threshold_k)
+            )
+            sparsity_k = 1.0 - (nz_counts_k.float() / K)
+            if sparsity_k > DENSE_THRESHOLD:
+                out_k = torch.matmul(act_2d, weight_k)
+            else:
+                out_k = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                    act_2d, weight_k, row_offsets_k, nz_col_indices_k
+                )
+            
+            # V 部分
+            nz_counts_v, nz_col_indices_v, row_offsets_v = torch.ops.sparse_op.thr_sparsify_to_icsr(
+                act_2d, float(threshold_v)
+            )
+            sparsity_v = 1.0 - (nz_counts_v.float() / K)
+            if sparsity_v > DENSE_THRESHOLD:
+                out_v = torch.matmul(act_2d, weight_v)
+            else:
+                out_v = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                    act_2d, weight_v, row_offsets_v, nz_col_indices_v
+                )
+            
         # 拼接结果
         out_2d = torch.cat([out_q, out_k, out_v], dim=1)
         return out_2d.view(B, S, N)
@@ -240,6 +257,11 @@ class QKVSparseGEMMiCSRSVEGatherKernel(BaseKernel):
         N_k = weight_k.size(1)
         N_v = weight_v.size(1)
         N = N_q + N_k + N_v
+        if (K,N_q) not in [(4096,4096)]:
+            out_q = torch.matmul(activation, weight_q)
+            out_k = torch.matmul(activation, weight_k)
+            out_v = torch.matmul(activation, weight_v)
+            return torch.cat([out_q, out_k, out_v], dim=1).view(B, S, N)
         
         act_2d = activation.view(-1, K)
         BM = act_2d.shape[0]
@@ -347,18 +369,24 @@ class LNSparseGEMViCSRSVEGatherKernel(BaseKernel):
         threshold: float
     ) -> torch.Tensor:
         B, M, K = activation.shape
+        N = weight.shape[1]
+        if (K,N) not in [(4096,4096)]:
+            out = torch.matmul(x, weight)
+            return out.view(B, M, weight.size(1))
+
         x = activation.view(-1, K)
         nz_counts, nz_col_indices, row_offsets = torch.ops.sparse_op.thr_sparsify_to_icsr(x, threshold)
         nz_count = nz_counts[0]
         sparsity = nz_count / K
-        if sparsity < DENSE_THRESHOLD:
-            # TODO: check use torch.matmul or my own gemm
-            # TODO: shape matters
-            out = torch.matmul(x, weight)
-        else:
+        if sparsity > DENSE_THRESHOLD:
             out = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
                 x, weight, row_offsets, nz_col_indices
             )
+            # TODO: check use torch.matmul or my own gemm
+            # TODO: shape matters
+        else:
+            out = torch.matmul(x, weight)
+
         return out.view(B, M, weight.size(1))
 
 
@@ -386,6 +414,10 @@ class LNSparseGEMMiCSRSVEGatherKernel(BaseKernel):
         load_sve_sparse_gemm_extension()
         B, M, K = activation.shape
         N = weight.size(1)
+        if (K,N) not in [(4096,4096)]:
+            out = torch.matmul(activation, weight)
+            return out.view(B, M, weight.size(1))
+        
         x = activation.view(-1, K)
         BM = x.shape[0]
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve(x, threshold)

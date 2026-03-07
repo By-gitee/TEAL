@@ -67,7 +67,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
   // ---------------- Pass 1: Thread-local counts per column (uint32) ----------------
   std::vector<uint32_t> local_counts((size_t)num_threads * (size_t)K, 0);
 
-#ifdef _OPENMP
+  #ifdef _OPENMP
 #pragma omp parallel
 #endif
   {
@@ -121,7 +121,10 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
 #endif
     }
   }
+  Tensor col_ptr = torch::empty({K + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  int64_t* ptr = col_ptr.data_ptr<int64_t>();
 
+  ptr[0] = 0;
   // ---------------- Reduce thread-local counts to col_counts (int64) ----------------
   std::vector<int64_t> col_counts((size_t)K, 0);
 
@@ -137,13 +140,12 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
     col_counts[kk] = sum;
   }
 
-  // ---------------- Pass 2: Build col_ptr (int64 [K+1], prefix sum) ----------------
-  Tensor col_ptr = torch::empty({K + 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-  int64_t* ptr = col_ptr.data_ptr<int64_t>();
-  ptr[0] = 0;
+  // ---------------- Prefix sum (sequential) ----------------
+  // Must be done sequentially: ptr[k+1] depends on ptr[k].
   for (int64_t k = 0; k < K; ++k) {
     ptr[k + 1] = ptr[k] + col_counts[(size_t)k];
   }
+
   const int64_t total_nnz = ptr[K];
 
   Tensor row_indices = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
@@ -171,7 +173,7 @@ thr_sparsify_to_csc(torch::Tensor activation, double threshold) {
 #endif
   }
 
-  // ---------------- Pass 3: Write row_indices and values (no atomics) ----------------
+  // ---------------- Pass 2: Write row_indices and values (no atomics) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif

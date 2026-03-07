@@ -58,35 +58,35 @@ thr_sparsify_to_coo(torch::Tensor activation, double threshold) {
   // counts per row (int64)
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* counts = counts_t.data_ptr<int64_t>();
-
   // ---------------- Pass1: count nnz per row ----------------
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
+  #ifdef _OPENMP
+  #pragma omp parallel for schedule(static)
+  #endif
   for (int64_t m = 0; m < M; ++m) {
     const float* row = act_ptr + m * K;
     int64_t nnz = 0;
-
+    
     // Help auto-vectorization: simple loop + simd reduction.
     // Use abs_f32_fast to avoid std::fabs overhead and keep float domain.
-#if defined(_OPENMP)
-#pragma omp simd reduction(+:nnz)
-#endif
+    #if defined(_OPENMP)
+    #pragma omp simd reduction(+:nnz)
+    #endif
     for (int64_t k = 0; k < K; ++k) {
       const float ax = abs_f32_fast(row[k]);
       nnz += (ax >= thr);
     }
-
+    
     counts[m] = nnz;
   }
 
-  // ---------------- row_offsets prefix sum (M+1) for internal use ----------------
-  // We compute row_offsets to know where each row's data starts in the flat arrays
   std::vector<int64_t> row_offsets(M + 1);
   row_offsets[0] = 0;
   for (int64_t m = 0; m < M; ++m) {
     row_offsets[m + 1] = row_offsets[m] + counts[m];
   }
+  // ---------------- row_offsets prefix sum (M+1) for internal use ----------------
+  // We compute row_offsets to know where each row's data starts in the flat arrays
+
   const int64_t total_nnz = row_offsets[M];
 
   // ---------------- Allocate COO arrays: row_indices, col_indices, values ----------------

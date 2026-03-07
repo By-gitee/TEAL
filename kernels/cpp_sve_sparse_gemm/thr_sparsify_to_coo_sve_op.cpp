@@ -59,7 +59,8 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_coo_sve(const Tensor& 
   // Allocate counts array to store non-zero count per row
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* counts = counts_t.data_ptr<int64_t>();
-
+  std::vector<int64_t> row_offsets(M + 1);
+  row_offsets[0] = 0;
   // ---------------- Pass 1: Count nnz per row (SVE vectorized) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
@@ -117,15 +118,11 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_coo_sve(const Tensor& 
       }
 #endif
       counts[m] = nnz;
+      row_offsets[m + 1] = row_offsets[m] + counts[m];
     }
   }
 
-  // ---------------- Pass 2: Compute row offsets via prefix sum ----------------
-  std::vector<int64_t> row_offsets(M + 1);
-  row_offsets[0] = 0;
-  for (int64_t m = 0; m < M; ++m) {
-    row_offsets[m + 1] = row_offsets[m] + counts[m];
-  }
+
   const int64_t total_nnz = row_offsets[M];
 
   // ---------------- Allocate output COO arrays ----------------
@@ -138,7 +135,7 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_coo_sve(const Tensor& 
   Tensor values = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
   float* out_val = (total_nnz > 0) ? values.data_ptr<float>() : nullptr;
 
-  // ---------------- Pass 3: Extract and write COO triplets using SVE2 compact ----------------
+  // ---------------- Pass 2: Extract and write COO triplets using SVE2 compact ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif

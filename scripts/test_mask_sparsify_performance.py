@@ -602,6 +602,7 @@ def main() -> None:
     parser.add_argument("--test-sizes", action="store_true", help="Test multiple matrix sizes")
     parser.add_argument("--skip-correctness", action="store_true", help="Skip correctness test")
     args = parser.parse_args()
+    
 
     print("=" * 80)
     print("mask_sparsify operator performance test")

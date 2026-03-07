@@ -56,6 +56,8 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
   // nz_counts_t: M, per-row nnz (used for row_offsets prefix sum)
   Tensor nz_counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* nz_counts = nz_counts_t.data_ptr<int64_t>();
+  std::vector<int64_t> row_offsets(M + 1);
+  row_offsets[0] = 0;
 
   // ---------------- Pass 1: Count nnz per row into nz_counts[0..M-1] (SVE vectorized) ----------------
 #ifdef _OPENMP
@@ -117,19 +119,18 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
     }
   }
 
-  // ---------------- Pass 2: Compute row_offsets (prefix sum over nz_counts[0..M-1]) ----------------
-  std::vector<int64_t> row_offsets(M + 1);
-  row_offsets[0] = 0;
+  // ---------------- Prefix sum (sequential) ----------------
+  // Must be done sequentially: row_offsets[m+1] depends on row_offsets[m].
   for (int64_t m = 0; m < M; ++m) {
     row_offsets[m + 1] = row_offsets[m] + nz_counts[m];
   }
+
   const int64_t total_nnz = row_offsets[M];
 
-  // ---------------- Allocate output column index array (uint32, flattened) ----------------
   Tensor nz_col_indices = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
   uint32_t* out_idx = (total_nnz > 0 ? nz_col_indices.data_ptr<uint32_t>() : nullptr);
 
-  // ---------------- Pass 3: Write compressed column indices by row (using row_offsets) ----------------
+  // ---------------- Pass 2: Write compressed column indices by row (using row_offsets) ----------------
 #ifdef _OPENMP
 #pragma omp parallel
 #endif

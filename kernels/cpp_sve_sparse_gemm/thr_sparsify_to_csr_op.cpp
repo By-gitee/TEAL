@@ -57,7 +57,8 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
   // counts per row (int64)
   Tensor counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t* counts = counts_t.data_ptr<int64_t>();
-
+  std::vector<int64_t> row_offsets(M + 1);
+  row_offsets[0] = 0;
   // ---------------- Pass1: count nnz per row ----------------
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -79,12 +80,12 @@ thr_sparsify_to_csr(torch::Tensor activation, double threshold) {
     counts[m] = nnz;
   }
 
-  // ---------------- row_offsets prefix sum (M+1) ----------------
-  std::vector<int64_t> row_offsets(M + 1);
-  row_offsets[0] = 0;
+  // ---------------- row_offsets prefix sum (M+1, sequential) ----------------
+  // Must be done sequentially: row_offsets[m+1] depends on row_offsets[m].
   for (int64_t m = 0; m < M; ++m) {
     row_offsets[m + 1] = row_offsets[m] + counts[m];
   }
+
   const int64_t total_nnz = row_offsets[M];
 
   // ---------------- Allocate CSR arrays: nz_col_indices + values ----------------
