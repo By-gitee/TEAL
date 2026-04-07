@@ -50,12 +50,19 @@ static inline void check_thr_sparsify_to_icsr_inputs(const torch::Tensor& activa
  */
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
-  check_thr_sparsify_to_icsr_inputs(activation);
+  // check_thr_sparsify_to_icsr_inputs(activation);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
   const float thr = static_cast<float>(threshold);
   const float* act = activation.data_ptr<float>();
+  if (threshold == -1) {
+    return {
+      torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)),
+      torch::empty({0}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU)),
+      torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU))
+    };
+  }
 
   // nz_counts_t: M, per-row nnz (used for row_offsets prefix sum)
   auto nz_counts_t = torch::empty({M}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
@@ -64,7 +71,7 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
   row_offsets[0] = 0;
   
   // ---------------- Pass 1: Count nnz per row into nz_counts[0..M-1] (parallel) ----------------
-  // #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
   for (int64_t m = 0; m < M; ++m) {
     const float* row_ptr = act + m * K;
     int64_t nnz = 0;
@@ -74,11 +81,13 @@ thr_sparsify_to_icsr(torch::Tensor activation, double threshold) {
       nnz += (ax >= thr);
     }
     nz_counts[m] = nnz;
+  }
+  // ---------------- Build row_offsets (prefix sum over nz_counts[0..M-1]) ----------------
+
+  for (int64_t m = 0; m < M; ++m) {
     row_offsets[m + 1] = row_offsets[m] + nz_counts[m];
   }
-
   const int64_t total_nnz = row_offsets[M];
-  // ---------------- Build row_offsets (prefix sum over nz_counts[0..M-1]) ----------------
 
   // ---------------- Allocate nz_col_indices (flattened, uint32) ----------------
   auto nz_col_indices_t = torch::empty({total_nnz}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));

@@ -3,6 +3,8 @@ from kernels.sve_sparse_gemm import (
     measure_latency,
     SparseGEMViCSRSVEGatherKernel,
     SparseGEMMiCSRSVEGatherKernel,
+    DenseGEMMSVEOMPKernel,
+    dense_gemm_sve_omp,
 )
 
 __all__ = [
@@ -10,4 +12,6 @@ __all__ = [
     "measure_latency",
     "SparseGEMViCSRSVEGatherKernel",
     "SparseGEMMiCSRSVEGatherKernel",
+    "DenseGEMMSVEOMPKernel",
+    "dense_gemm_sve_omp",
 ]

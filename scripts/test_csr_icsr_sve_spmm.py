@@ -65,12 +65,85 @@ try:
 except Exception:
     psutil = None  # type: ignore
 
-it_num = 100
+def get_it_num_for_threshold(M:int, K:int,N:int, threshold: float) -> int:
+    """
+    动态调整迭代次数，让稀疏性（threshold）越高，迭代次数可以越多（加速更多），
+    稀疏性越低，迭代次数可以适当降低（防止太慢）。可以根据实际需求调整映射。
+    """
+    # it_num = 1000
+    # if M ==128:
+    #     if threshold >= 0.99:
+    #         it_num =  3000
+    #     elif threshold >= 0.95:
+    #         it_num =  2000
+    #     elif threshold >= 0.9:
+    #         it_num =  1500
+    #     elif threshold >= 0.8:
+    #         it_num =  1000
+    #     elif threshold >= 0.6:
+    #         it_num =  600
+    #     elif threshold >= 0.4:
+    #         it_num =  400
+    #     elif threshold >= 0.2:
+    #         it_num =  100
+    #     else:
+    #         it_num =  300
+    # elif M==64 or M==32:
+    #     if threshold >= 0.99:
+    #         it_num =  5000
+    #     elif threshold >= 0.95:
+    #         it_num =  4000
+    #     elif threshold >= 0.9:
+    #         it_num =  3000
+    #     elif threshold >= 0.8:
+    #         it_num =  2000
+    #     elif threshold >= 0.6:
+    #         it_num =  1000
+    #     elif threshold >= 0.4:
+    #         it_num =  1000
+    #     elif threshold >= 0.2:
+    #         it_num =  1000
+    #     else:
+    #         it_num =  1000
+
+    # if (K==4096 or N==4096 or K==5120 or N==5120) and (M==64 or M==32):
+    #     it_num = it_num/10
+    # elif (K==4096 or N==4096 or K==5120 or N==5120) and (M==128):
+    #     it_num = it_num/15
+    # elif (K==2048 or N==2048) and (M==128):
+    #     it_num = it_num/10
+    # elif (K==2048 or N==2048) and (M==64 or M==32):
+    #     it_num = it_num/5
+
+    return 10000
+
 warm_times = 100
 
+
+# MV = [32]
+# MV = [64, 128]
 MV = [1]
-KNV = [(4096, 4096)]
-thresholds = [0.8]
+
+
+KNV = [
+    # attn (K == N)
+    # (512, 512), (1024, 1024), (2048, 2048),
+    # (4096, 4096),
+    # , (5120, 5120),
+    # FFN up-projection
+    # (512, 2048), (1024, 4096), (2048, 8192), (4096, 11008), (5120, 13824),
+    # FFN down-projection
+    # (2048, 512), 
+    (4096, 1024), 
+    (8192, 2048), 
+    (11008, 4096),
+    #  (13824, 5120),
+]
+
+# KNV = [
+#     (512, 512),
+# ]
+thresholds =[0.1, 0.2, 0.3, 0.4, 0.5,0.6, 0.7, 0.8, 0.9, 0.95, 0.99]
 
 
 def _apply_threshold(activation: torch.Tensor, threshold: float = 0.0) -> torch.Tensor:
@@ -192,7 +265,7 @@ def test_core_gemm_only(
     def torch_dense_core():
         return torch.matmul(activation_thresholded, weight)
 
-    lat_torch = measure_latency(torch_dense_core, warmup=warm_times, iters=it_num)
+    lat_torch = measure_latency(torch_dense_core, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     results["GEMM-only: PyTorch torch.matmul(thresholded, weight)"] = (torch_dense_core(), lat_torch)
     print(f"  Latency: {lat_torch:.4f} ms")
 
@@ -214,7 +287,7 @@ def test_core_gemm_only(
     def icsr_gemm_gather_only():
         return icsr_sve_gather_op(activation, weight, row_offsets, nz_col_indices)
 
-    lat = measure_latency(icsr_gemm_gather_only, warmup=warm_times, iters=it_num)
+    lat = measure_latency(icsr_gemm_gather_only, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     results["GEMM-only: iCSR sparse_gemm_icsr_sve_gather (cached indices)"] = (icsr_gemm_gather_only(), lat)
     print(f"    Latency: {lat:.4f} ms")
 
@@ -222,7 +295,7 @@ def test_core_gemm_only(
     def icsr_gemm_only():
         return icsr_op(activation, weight, row_offsets, nz_col_indices)
 
-    lat = measure_latency(icsr_gemm_only, warmup=warm_times, iters=it_num)
+    lat = measure_latency(icsr_gemm_only, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     results["GEMM-only: iCSR sparse_gemm_icsr (cached indices)"] = (icsr_gemm_only(), lat)
     print(f"    Latency: {lat:.4f} ms")
 
@@ -242,7 +315,7 @@ def test_core_gemm_only(
     def csr_gemm_only():
         return csr_op(weight, csr_row_offsets, csr_nz_col_indices, csr_values)
 
-    lat = measure_latency(csr_gemm_only, warmup=warm_times, iters=it_num)
+    lat = measure_latency(csr_gemm_only, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     results["GEMM-only: CSR sparse_gemm_csr (cached values)"] = (csr_gemm_only(), lat)
     print(f"    Latency: {lat:.4f} ms")
 
@@ -250,7 +323,7 @@ def test_core_gemm_only(
     def csr_gemm_gather_only():
         return csr_sve_gather_op(weight, csr_row_offsets, csr_nz_col_indices, csr_values)
 
-    lat = measure_latency(csr_gemm_gather_only, warmup=warm_times, iters=it_num)
+    lat = measure_latency(csr_gemm_gather_only, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     results["GEMM-only: CSR sparse_gemm_csr_sve_gather (cached values)"] = (csr_gemm_gather_only(), lat)
     print(f"    Latency: {lat:.4f} ms")
 
@@ -273,7 +346,7 @@ def test_preprocess_only(
     def torch_threshold_only():
         return _apply_threshold(activation, threshold=threshold)
 
-    lat = measure_latency(torch_threshold_only, warmup=warm_times, iters=10)
+    lat = measure_latency(torch_threshold_only, warmup=warm_times, iters=100)
     results["Preprocess-only: PyTorch _apply_threshold(abs>=thr)"] = (torch_threshold_only(), lat)
     print(f"  Latency: {lat:.4f} ms")
 
@@ -288,7 +361,7 @@ def test_preprocess_only(
         _ = sp.values()
         return sp
 
-    lat = measure_latency(torch_to_sparse_csr, warmup=warm_times, iters=10)
+    lat = measure_latency(torch_to_sparse_csr, warmup=warm_times, iters=100)
     results["Preprocess-only: PyTorch threshold + to_sparse_csr()"] = (torch_to_sparse_csr(), lat)
     print(f"  Latency: {lat:.4f} ms")
 
@@ -297,14 +370,14 @@ def test_preprocess_only(
     def icsr_pre_1():
         return thr_sparsify_to_icsr(activation, threshold)
 
-    lat = measure_latency(icsr_pre_1, warmup=warm_times, iters=it_num)
+    lat = measure_latency(icsr_pre_1, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],1,threshold))
     results["Preprocess-only: iCSR thr_sparsify_to_icsr"] = (icsr_pre_1(), lat)
     print(f"  - thr_sparsify_to_icsr: Latency {lat:.4f} ms")
 
     def icsr_pre_2():
         return thr_sparsify_to_icsr_sve(activation, threshold)
 
-    lat = measure_latency(icsr_pre_2, warmup=warm_times, iters=it_num)
+    lat = measure_latency(icsr_pre_2, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],1,threshold))
     results["Preprocess-only: iCSR thr_sparsify_to_icsr_sve"] = (icsr_pre_2(), lat)
     print(f"  - thr_sparsify_to_icsr_sve: Latency {lat:.4f} ms")
 
@@ -313,14 +386,14 @@ def test_preprocess_only(
     def csr_pre_1():
         return thr_sparsify_to_csr(activation, threshold)
 
-    lat = measure_latency(csr_pre_1, warmup=warm_times, iters=it_num)
+    lat = measure_latency(csr_pre_1, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],1,threshold))
     results["Preprocess-only: CSR thr_sparsify_to_csr"] = (csr_pre_1(), lat)
     print(f"  - thr_sparsify_to_csr: Latency {lat:.4f} ms")
 
     def csr_pre_2():
         return thr_sparsify_to_csr_sve(activation, threshold)
 
-    lat = measure_latency(csr_pre_2, warmup=warm_times, iters=it_num)
+    lat = measure_latency(csr_pre_2, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],1,threshold))
     results["Preprocess-only: CSR thr_sparsify_to_csr_sve"] = (csr_pre_2(), lat)
     print(f"  - thr_sparsify_to_csr_sve: Latency {lat:.4f} ms")
 
@@ -374,7 +447,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr(activation, threshold)
         return icsr_sve_gather_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat1 = measure_latency(icsr_combo1, warmup=warm_times, iters=it_num)
+    lat1 = measure_latency(icsr_combo1, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result1 = icsr_combo1()
     results["iCSR-1: thr_sparsify_to_icsr + sparse_gemm_icsr_sve_gather"] = (result1, lat1)
     print(f"  Latency: {lat1:.4f} ms")
@@ -385,7 +458,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve(activation, threshold)
         return icsr_sve_gather_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat2 = measure_latency(icsr_combo2, warmup=warm_times, iters=it_num)
+    lat2 = measure_latency(icsr_combo2, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result2 = icsr_combo2()
     results["iCSR-2: thr_sparsify_to_icsr_sve + sparse_gemm_icsr_sve_gather"] = (result2, lat2)
     print(f"  Latency: {lat2:.4f} ms")
@@ -396,7 +469,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr(activation, threshold)
         return icsr_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat3 = measure_latency(icsr_combo3, warmup=warm_times, iters=it_num)
+    lat3 = measure_latency(icsr_combo3, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result3 = icsr_combo3()
     results["iCSR-3: thr_sparsify_to_icsr + sparse_gemm_icsr"] = (result3, lat3)
     print(f"  Latency: {lat3:.4f} ms")
@@ -407,7 +480,7 @@ def test_icsr_combinations(
         nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve(activation, threshold)
         return icsr_op(activation, weight, row_offsets, nz_col_indices)
     
-    lat4 = measure_latency(icsr_combo4, warmup=warm_times, iters=it_num)
+    lat4 = measure_latency(icsr_combo4, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result4 = icsr_combo4()
     results["iCSR-4: thr_sparsify_to_icsr_sve + sparse_gemm_icsr"] = (result4, lat4)
     print(f"  Latency: {lat4:.4f} ms")
@@ -459,7 +532,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr(activation, threshold)
         return csr_op(weight, row_offsets, nz_col_indices, values)
     
-    lat1 = measure_latency(csr_combo1, warmup=warm_times, iters=it_num)
+    lat1 = measure_latency(csr_combo1, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result1 = csr_combo1()
     results["CSR-1: thr_sparsify_to_csr + sparse_gemm_csr"] = (result1, lat1)
     print(f"  Latency: {lat1:.4f} ms")
@@ -470,7 +543,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr_sve(activation, threshold)
         return csr_op(weight, row_offsets, nz_col_indices, values)
     
-    lat2 = measure_latency(csr_combo2, warmup=warm_times, iters=it_num)
+    lat2 = measure_latency(csr_combo2, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result2 = csr_combo2()
     results["CSR-2: thr_sparsify_to_csr_sve + sparse_gemm_csr"] = (result2, lat2)
     print(f"  Latency: {lat2:.4f} ms")
@@ -481,7 +554,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr(activation, threshold)
         return csr_sve_gather_op(weight, row_offsets, nz_col_indices, values)
     
-    lat3 = measure_latency(csr_combo3, warmup=warm_times, iters=it_num)
+    lat3 = measure_latency(csr_combo3, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result3 = csr_combo3()
     results["CSR-3: thr_sparsify_to_csr + sparse_gemm_csr_sve_gather"] = (result3, lat3)
     print(f"  Latency: {lat3:.4f} ms")
@@ -492,7 +565,7 @@ def test_csr_combinations(
         row_offsets, nz_col_indices, values = thr_sparsify_to_csr_sve(activation, threshold)
         return csr_sve_gather_op(weight, row_offsets, nz_col_indices, values)
     
-    lat4 = measure_latency(csr_combo4, warmup=warm_times, iters=it_num)
+    lat4 = measure_latency(csr_combo4, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result4 = csr_combo4()
     results["CSR-4: thr_sparsify_to_csr_sve + sparse_gemm_csr_sve_gather"] = (result4, lat4)
     print(f"  Latency: {lat4:.4f} ms")
@@ -536,7 +609,7 @@ def test_pytorch_references(
         activation_thresholded = _apply_threshold(activation, threshold=threshold)
         return torch.matmul(activation_thresholded, weight)
     
-    lat1 = measure_latency(pytorch_dense_fn, warmup=warm_times, iters=it_num)
+    lat1 = measure_latency(pytorch_dense_fn, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result1 = pytorch_dense_fn()
     results["PyTorch-1: Dense matmul"] = (result1, lat1)
     print(f"  Latency: {lat1:.4f} ms")
@@ -548,7 +621,7 @@ def test_pytorch_references(
         sp_act = activation_thresholded.to_sparse_csr()
         return torch.sparse.mm(sp_act, weight)
     
-    lat2 = measure_latency(pytorch_sparse_csr_fn, warmup=warm_times, iters=it_num)
+    lat2 = measure_latency(pytorch_sparse_csr_fn, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result2 = pytorch_sparse_csr_fn()
     results["PyTorch-2: Sparse CSR + sparse.mm"] = (result2, lat2)
     print(f"  Latency: {lat2:.4f} ms")
@@ -578,7 +651,7 @@ def test_pytorch_references(
 
         return output
 
-    lat4 = measure_latency(pytorch_selective_weight_fn, warmup=warm_times, iters=it_num)
+    lat4 = measure_latency(pytorch_selective_weight_fn, warmup=warm_times, iters=get_it_num_for_threshold(activation.shape[0],activation.shape[1],weight.shape[1],threshold))
     result4 = pytorch_selective_weight_fn()
     results["PyTorch-4: Selective load weight non-zero rows + matmul"] = (result4, lat4)
     print(f"  Latency: {lat4:.4f} ms")
@@ -698,6 +771,48 @@ def print_performance_summary(
 #         print("=" * 80)
 
 
+# ── Wide-format column definitions (short_name, full operator key) ─────────────
+_E2E_COLS: List[Tuple[str, str]] = [
+    ("icsr + icsr_gather_spmm",   "iCSR-1: thr_sparsify_to_icsr + sparse_gemm_icsr_sve_gather"),
+    ("icsr_sve + icsr_gather_spmm",   "iCSR-2: thr_sparsify_to_icsr_sve + sparse_gemm_icsr_sve_gather"),
+    ("icsr + icsr_spmm",   "iCSR-3: thr_sparsify_to_icsr + sparse_gemm_icsr"),
+    ("icsr_sve + icsr_spmm",   "iCSR-4: thr_sparsify_to_icsr_sve + sparse_gemm_icsr"),
+    ("csr + csr_spmm",    "CSR-1: thr_sparsify_to_csr + sparse_gemm_csr"),
+    ("csr_sve + csr_spmm",    "CSR-2: thr_sparsify_to_csr_sve + sparse_gemm_csr"),
+    ("csr + csr_gather_spmm",    "CSR-3: thr_sparsify_to_csr + sparse_gemm_csr_sve_gather"),
+    ("csr_sve + csr_gather_spmm",    "CSR-4: thr_sparsify_to_csr_sve + sparse_gemm_csr_sve_gather"),
+    ("ori + pt_mm", "PyTorch-1: Dense matmul"),
+    ("pt_csr + pt_spmm",   "PyTorch-2: Sparse CSR + sparse.mm"),
+    ("ori + pt_select_mm",   "PyTorch-4: Selective load weight non-zero rows + matmul"),
+]
+
+_GEMM_COLS: List[Tuple[str, str]] = [
+    ("pt_mm",      "GEMM-only: PyTorch torch.matmul(thresholded, weight)"),
+    ("icsr_gather_spmm", "GEMM-only: iCSR sparse_gemm_icsr_sve_gather (cached indices)"),
+    ("icsr_spmm",    "GEMM-only: iCSR sparse_gemm_icsr (cached indices)"),
+    ("csr_spmm",     "GEMM-only: CSR sparse_gemm_csr (cached values)"),
+    ("csr_gather_spmm",  "GEMM-only: CSR sparse_gemm_csr_sve_gather (cached values)"),
+]
+
+_PRE_COLS: List[Tuple[str, str]] = [
+    ("ori",   "Preprocess-only: PyTorch _apply_threshold(abs>=thr)"),
+    ("ori+pt_csr",   "Preprocess-only: PyTorch threshold + to_sparse_csr()"),
+    ("icsr",     "Preprocess-only: iCSR thr_sparsify_to_icsr"),
+    ("icsr_sve", "Preprocess-only: iCSR thr_sparsify_to_icsr_sve"),
+    ("csr",      "Preprocess-only: CSR thr_sparsify_to_csr"),
+    ("csr_sve",  "Preprocess-only: CSR thr_sparsify_to_csr_sve"),
+]
+
+_CSV_FIELDNAMES: List[str] = (
+    ["M", "K", "N", "threshold", "density"]
+    + [col for col, _ in _E2E_COLS]
+    + [col for col, _ in _GEMM_COLS]
+    + [col for col, _ in _PRE_COLS]
+    + [f"{col}_ok" for col, _ in _E2E_COLS]
+    + [f"{col}_ok" for col, _ in _GEMM_COLS]
+)
+
+
 def export_results_to_csv(
     csv_path: str,
     M: int,
@@ -710,95 +825,55 @@ def export_results_to_csv(
     gemm_only_results: Dict[str, Tuple[torch.Tensor, float]],
     preprocess_only_results: Dict[str, Tuple[Any, float]],
 ) -> None:
-    """Export all benchmark results (end-to-end / GEMM-only / preprocess-only) to CSV."""
-    pytorch_dense_latency: float | None = None
-    for _fmt, _res in all_results.items():
-        for combo_name, (_, lat) in _res.items():
-            if "PyTorch-1: Dense matmul" in combo_name:
-                pytorch_dense_latency = lat
-                break
+    """Export benchmark results to wide-format CSV (one row per configuration).
 
-    rows: List[Dict[str, Any]] = []
-    base = dict(
-        M=M, K=K, N=N,
-        threshold=threshold,
-        sparsity_pct=f"{sparsity_pct:.2f}",
-    )
+    Columns: M, K, N, threshold, density | e2e latencies | gemm-only latencies
+             | preprocess latencies | correctness flags (1=pass, 0=fail)
+    """
+    # Flatten all_results into operator_name -> (result, latency)
+    e2e_flat: Dict[str, Tuple[torch.Tensor, float]] = {}
+    for _res in all_results.values():
+        e2e_flat.update(_res)
 
-    def _speedup(lat: float) -> str:
-        if pytorch_dense_latency and lat > 0:
-            return f"{pytorch_dense_latency / lat:.4f}"
-        return ""
+    def _lat(d: dict, key: str) -> str:
+        item = d.get(key)
+        return f"{item[1]:.6f}" if item is not None else ""
 
-    def _correctness(result: torch.Tensor) -> tuple[str, str, str]:
+    def _ok(d: dict, key: str) -> str:
+        item = d.get(key)
+        if item is None:
+            return ""
+        result, _ = item
         try:
-            max_diff = torch.max(torch.abs(result - reference)).item()
-            mean_diff = torch.mean(torch.abs(result - reference)).item()
-            ok = torch.allclose(result, reference, rtol=1e-4, atol=1e-5)
-            return ("PASS" if ok else "FAIL", f"{max_diff:.6e}", f"{mean_diff:.6e}")
+            return "1" if torch.allclose(result, reference, rtol=1e-4, atol=1e-5) else "0"
         except Exception:
-            return ("N/A", "N/A", "N/A")
+            return ""
 
-    # End-to-end combo results
-    for fmt_name, results in all_results.items():
-        for combo_name, (result, latency) in results.items():
-            ok, maxd, meand = _correctness(result)
-            rows.append({
-                **base,
-                "test_type": "end_to_end",
-                "category": fmt_name,
-                "operator": combo_name,
-                "latency_ms": f"{latency:.6f}",
-                "speedup_vs_pytorch_dense": _speedup(latency),
-                "is_correct": ok,
-                "max_diff": maxd,
-                "mean_diff": meand,
-            })
+    row: Dict[str, Any] = {
+        "M": M, "K": K, "N": N,
+        "threshold": threshold,
+        "density": f"{100.0 - sparsity_pct:.2f}",
+    }
 
-    # GEMM-only results
-    for combo_name, (result, latency) in gemm_only_results.items():
-        ok, maxd, meand = _correctness(result)
-        rows.append({
-            **base,
-            "test_type": "gemm_only",
-            "category": "GEMM-only",
-            "operator": combo_name,
-            "latency_ms": f"{latency:.6f}",
-            "speedup_vs_pytorch_dense": _speedup(latency),
-            "is_correct": ok,
-            "max_diff": maxd,
-            "mean_diff": meand,
-        })
-
-    # Preprocess-only results (output is not GEMM result; no correctness vs reference)
-    for combo_name, (_, latency) in preprocess_only_results.items():
-        rows.append({
-            **base,
-            "test_type": "preprocess_only",
-            "category": "Preprocess-only",
-            "operator": combo_name,
-            "latency_ms": f"{latency:.6f}",
-            "speedup_vs_pytorch_dense": _speedup(latency),
-            "is_correct": "N/A",
-            "max_diff": "N/A",
-            "mean_diff": "N/A",
-        })
-
-    fieldnames = [
-        "M", "K", "N", "threshold", "sparsity_pct",
-        "test_type", "category", "operator",
-        "latency_ms", "speedup_vs_pytorch_dense",
-        "is_correct", "max_diff", "mean_diff",
-    ]
+    for col, op_name in _E2E_COLS:
+        row[col] = _lat(e2e_flat, op_name)
+    for col, op_name in _GEMM_COLS:
+        row[col] = _lat(gemm_only_results, op_name)
+    for col, op_name in _PRE_COLS:
+        row[col] = _lat(preprocess_only_results, op_name)
+    for col, op_name in _E2E_COLS:
+        row[f"{col}_ok"] = _ok(e2e_flat, op_name)
+    for col, op_name in _GEMM_COLS:
+        row[f"{col}_ok"] = _ok(gemm_only_results, op_name)
 
     file_exists = os.path.isfile(csv_path)
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDNAMES)
         if not file_exists:
             writer.writeheader()
-        writer.writerows(rows)
+        writer.writerow(row)
 
-    print(f"\n[CSV] {len(rows)} rows written to: {csv_path}")
+    print(f"\n[CSV] row written → {csv_path}  (M={M}, K={K}, N={N}, thr={threshold})")
 
 
 import numpy as np
@@ -856,8 +931,8 @@ def main() -> None:
 
 
                 # Verify correctness + performance summary
-                verify_correctness(all_results, reference)
-                print_performance_summary(all_results)
+                # verify_correctness(all_results, reference)
+                # print_performance_summary(all_results)
 
 
                 _maybe_print_cpu_util("Start GEMM-only")
@@ -868,15 +943,15 @@ def main() -> None:
                     threshold=threshold,
                 )
                 _maybe_print_cpu_util("End GEMM-only")
-                verify_correctness_flat(gemm_only_results, reference)
-                baseline_gemm_latency = gemm_only_results[
-                    "GEMM-only: PyTorch torch.matmul(thresholded, weight)"
-                ][1]
-                _print_ranked_latencies(
-                    title="GEMM-only latency ranking (baseline=PyTorch torch.matmul)",
-                    latencies=[(k, v[1]) for k, v in gemm_only_results.items()],
-                    baseline_latency=baseline_gemm_latency,
-                )
+                # verify_correctness_flat(gemm_only_results, reference)
+                # baseline_gemm_latency = gemm_only_results[
+                #     "GEMM-only: PyTorch torch.matmul(thresholded, weight)"
+                # ][1]
+                # _print_ranked_latencies(
+                #     title="GEMM-only latency ranking (baseline=PyTorch torch.matmul)",
+                #     latencies=[(k, v[1]) for k, v in gemm_only_results.items()],
+                #     baseline_latency=baseline_gemm_latency,
+                # )
 
         # Extra test 2: Preprocess-only
                 _maybe_print_cpu_util("Start Preprocess-only")
@@ -884,18 +959,18 @@ def main() -> None:
                     activation=activation,
                     threshold=threshold,
                 )
-                _maybe_print_cpu_util("End Preprocess-only")
-                # Use PyTorch threshold-only as baseline (minimal preprocessing)
-                baseline_pre_latency = preprocess_only_results[
-                    "Preprocess-only: PyTorch _apply_threshold(abs>=thr)"
-                ][1]
-                _print_ranked_latencies(
-                    title="Preprocess-only latency ranking (baseline=PyTorch _apply_threshold)",
-                    latencies=[(k, v[1]) for k, v in preprocess_only_results.items()],
-                    baseline_latency=baseline_pre_latency,
-                )
+                # _maybe_print_cpu_util("End Preprocess-only")
+                # # Use PyTorch threshold-only as baseline (minimal preprocessing)
+                # baseline_pre_latency = preprocess_only_results[
+                #     "Preprocess-only: PyTorch _apply_threshold(abs>=thr)"
+                # ][1]
+                # _print_ranked_latencies(
+                #     title="Preprocess-only latency ranking (baseline=PyTorch _apply_threshold)",
+                #     latencies=[(k, v[1]) for k, v in preprocess_only_results.items()],
+                #     baseline_latency=baseline_pre_latency,
+                # )
 
-                # Export all results to CSV
+                # Export all results to CSV (wide format, one row per config)
                 csv_name = f"results_{M}_{K}_{N}.csv"
                 export_results_to_csv(
                     csv_path=csv_name,

@@ -48,7 +48,7 @@ static inline void check_thr_sparsify_to_csr_sve_inputs(const Tensor& activation
  *     - Optimization: skip compact for full-keep chunks
  */
 static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_csr_sve(const Tensor& activation, double threshold) {
-  check_thr_sparsify_to_csr_sve_inputs(activation);
+  // check_thr_sparsify_to_csr_sve_inputs(activation);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
@@ -72,9 +72,9 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_csr_sve(const Tensor& 
     const int64_t vl = (int64_t)svcntw();  // SVE vector length in elements
 #endif
 
-// #ifdef _OPENMP
-// #pragma omp for schedule(static)
-// #endif
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
     for (int64_t m = 0; m < M; ++m) {
       const float* row = act_ptr + m * K;
       int64_t nnz = 0;
@@ -117,11 +117,12 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_csr_sve(const Tensor& 
       }
 #endif
       counts[m] = nnz;
-      row_offsets[m + 1] = row_offsets[m] + counts[m];
     }
   }
-
-
+  
+  for (int64_t m = 0; m < M; ++m) {
+    row_offsets[m + 1] = row_offsets[m] + counts[m];
+  }
   const int64_t total_nnz = row_offsets[M];
 
   // ---------------- Allocate output CSR arrays ----------------

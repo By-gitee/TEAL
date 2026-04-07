@@ -26,11 +26,14 @@ and a simple latency measurement helper.
 
 from __future__ import annotations
 
+import csv
 import os
 import platform
+import threading
+import time
 from pathlib import Path
 from types import ModuleType
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import Tensor
@@ -78,6 +81,10 @@ _REQUIRED_OPS = (
     "mask_sparsify_to_csc_scatter",
 )
 
+_REQUIRED_DENSE_OPS = (
+    "dense_gemm_sve_omp",
+)
+
 
 def _extra_cflags() -> list[str]:
     if os.name == "nt":
@@ -93,21 +100,39 @@ def _extra_ldflags() -> list[str]:
         return []
     return ["-fopenmp"]
 
+MKN2sparsity = {
+    (1,4096,4096): 0.17,
+    (1,4096,11008): 0.13,
+    (1,11008,4096): 0.20,
+    (128,4096,4096): 0.86,
+    (128,4096,11008): 0.82,
+    (128,11008,4096): 0.90,
+}
+
+DEFAULT_SPARSITY = 0.0
+
+
 
 def load_sve_sparse_gemm_extension(
     rebuild: bool = False,
     verbose: bool = False,
 ) -> Optional[ModuleType]:
     """Compile and load the C++ extension; skip if ops are already registered."""
-    if not rebuild and hasattr(torch.ops, "sparse_op"):
-        op = torch.ops.sparse_op
-        if all(hasattr(op, name) for name in _REQUIRED_OPS):
+    if not rebuild:
+        sparse_ready = hasattr(torch.ops, "sparse_op") and all(
+            hasattr(torch.ops.sparse_op, name) for name in _REQUIRED_OPS
+        )
+        dense_ready = hasattr(torch.ops, "dense_op") and all(
+            hasattr(torch.ops.dense_op, name) for name in _REQUIRED_DENSE_OPS
+        )
+        if sparse_ready and dense_ready:
             return None
 
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     return load(
         name=EXT_NAME,
         sources=[
+            str(CPP_ROOT / "dense_gemm_sve_omp.cpp"),
             str(CPP_ROOT / "sparse_gemm_icsr_sve_gather_op.cpp"),
             str(CPP_ROOT / "sparse_gemm_csr_op.cpp"),
             str(CPP_ROOT / "sparse_gemm_csr_sve_gather_op.cpp"),
@@ -138,7 +163,62 @@ def load_sve_sparse_gemm_extension(
         verbose=verbose,
     )
 
-class QKVSparseGEMViCSRSVEGatherKernel(BaseKernel):
+#==============================Dense Version================================
+class DenseGEMV(BaseKernel):
+    def meta(self, x: torch.Tensor, W: torch.Tensor, threshold: float, *args, **kwargs) -> torch.Tensor:
+        return x.new_empty(x.shape[0], x.shape[1], W.shape[1])
+    
+    def forward(self, x: torch.Tensor, W: torch.Tensor, threshold: float, *args, **kwargs) -> torch.Tensor:
+        x_2d = x.view(-1, x.shape[2])
+        return torch.ops.dense_op.dense_gemm_sve_omp(x_2d, W).view(x.shape[0], x.shape[1], W.shape[1])
+        # return torch.matmul(x, W)
+
+#============================All SVE Sparsr Version==========================
+import numpy as np
+from collections import defaultdict
+import csv
+import atexit
+import os
+
+class SVEGatherGEMV(BaseKernel):
+    def meta(
+        self,
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold: float,
+    ) -> torch.Tensor:
+        return x.new_empty((x.size(0), x.size(1), W.size(1)))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold: float,
+    ) -> torch.Tensor:
+        B, M, K = x.shape
+        N = W.shape[1]
+        x_2d = x.view(-1, K)
+
+        if M > 1:
+            split_idx = x_2d.size(0) // 2
+            x_dense = x_2d[:split_idx]
+            out_dense = torch.ops.dense_op.dense_gemm_sve_omp(x_dense, W)
+
+            x_sparse = x_2d[split_idx:]
+            _, nz_col_indices, row_offsets = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold)
+            out_sparse = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                x_sparse, W, row_offsets, nz_col_indices
+            )
+
+            out = torch.cat([out_dense, out_sparse], dim=0)
+            return out.view(B, M, N)
+        
+        _, nz_col_indices, row_offsets = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold)
+        out = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W, row_offsets, nz_col_indices)
+
+        return out.view(B, M, N)
+
+class QKVSVEGatherGEMV(BaseKernel):
     """
     3D activation (B, S, K) -> view to (B*S, K), then sparse GEMV/GEMM, output (B, S, N).
     使用三个不同的 threshold 分别处理 Q、K、V 三部分的 weight。
@@ -146,308 +226,327 @@ class QKVSparseGEMViCSRSVEGatherKernel(BaseKernel):
 
     def meta(
         self,
-        activation: torch.Tensor,
-        weight_q: torch.Tensor,
-        weight_k: torch.Tensor,
-        weight_v: torch.Tensor,
+        x: torch.Tensor,
+        W: torch.Tensor,
         threshold_q: float,
         threshold_k: float,
         threshold_v: float,
+        kv_size: int,
+        W_q: torch.Tensor,
+        W_k: torch.Tensor,
+        W_v: torch.Tensor,
     ) -> torch.Tensor:
-        N = weight_q.size(1) + weight_k.size(1) + weight_v.size(1)
-        return activation.new_empty((activation.size(0), activation.size(1), N))
+        return x.new_empty((x.size(0), x.size(1), W.size(1)))
 
     def forward(
         self,
-        activation: torch.Tensor,
-        weight_q: torch.Tensor,
-        weight_k: torch.Tensor,
-        weight_v: torch.Tensor,
+        x: torch.Tensor,
+        W: torch.Tensor,
         threshold_q: float,
         threshold_k: float,
         threshold_v: float,
+        kv_size: int,
+        W_q: torch.Tensor,
+        W_k: torch.Tensor,
+        W_v: torch.Tensor,
     ) -> torch.Tensor:
-        B, S, K = activation.shape
-        N_q = weight_q.size(1)
-        N_k = weight_k.size(1)
-        N_v = weight_v.size(1)
-        N = N_q + N_k + N_v
-        if (K,N_q) not in [(4096,4096)]:
-            out_q = torch.matmul(activation, weight_q)
-            out_k = torch.matmul(activation, weight_k)
-            out_v = torch.matmul(activation, weight_v)
-            return torch.cat([out_q, out_k, out_v], dim=1).view(B, S, N)
-        else:
-            act_2d = activation.view(-1, K)
-            
-            # 分别处理 Q, K, V
-            # Q 部分
-            nz_counts_q, nz_col_indices_q, row_offsets_q = torch.ops.sparse_op.thr_sparsify_to_icsr(
-                act_2d, float(threshold_q)
+        B, M, K = x.shape
+        N = W.size(1)
+        x_2d = x.view(-1, K)
+
+        if M > 1:
+            split_idx = x_2d.size(0) // 2
+
+            # Q
+            x_dense = x_2d[:split_idx]
+            out_dense = torch.ops.dense_op.dense_gemm_sve_omp(x_dense, W)
+
+            x_sparse = x_2d[split_idx:]
+            _, nz_col_indices_q, row_offsets_q = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold_q)
+            out_sparse_q = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                x_sparse, W_q, row_offsets_q, nz_col_indices_q
             )
-            sparsity_q = 1.0 - (nz_counts_q.float() / K)
-            if sparsity_q > DENSE_THRESHOLD:
-                out_q = torch.matmul(act_2d, weight_q)
-            else:
-                out_q = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                    act_2d, weight_q, row_offsets_q, nz_col_indices_q
-                )
-            
-            # K 部分
-            nz_counts_k, nz_col_indices_k, row_offsets_k = torch.ops.sparse_op.thr_sparsify_to_icsr(
-                act_2d, float(threshold_k)
+
+            _, nz_col_indices_k, row_offsets_k = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold_k)
+            out_sparse_k = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                x_sparse, W_k, row_offsets_k, nz_col_indices_k
             )
-            sparsity_k = 1.0 - (nz_counts_k.float() / K)
-            if sparsity_k > DENSE_THRESHOLD:
-                out_k = torch.matmul(act_2d, weight_k)
-            else:
-                out_k = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                    act_2d, weight_k, row_offsets_k, nz_col_indices_k
-                )
-            
-            # V 部分
-            nz_counts_v, nz_col_indices_v, row_offsets_v = torch.ops.sparse_op.thr_sparsify_to_icsr(
-                act_2d, float(threshold_v)
+
+            _, nz_col_indices_v, row_offsets_v = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold_v)
+            out_sparse_v = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                x_sparse, W_v, row_offsets_v, nz_col_indices_v
             )
-            sparsity_v = 1.0 - (nz_counts_v.float() / K)
-            if sparsity_v > DENSE_THRESHOLD:
-                out_v = torch.matmul(act_2d, weight_v)
-            else:
-                out_v = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                    act_2d, weight_v, row_offsets_v, nz_col_indices_v
-                )
-            
-        # 拼接结果
+
+            out_sparse = torch.cat([out_sparse_q, out_sparse_k, out_sparse_v], dim=1)
+            out = torch.cat([out_dense, out_sparse], dim=0)
+            return out.view(B, M, N)
+
+        _, nz_col_indices_q, row_offsets_q = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold_q)
+        _, nz_col_indices_k, row_offsets_k = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold_k)
+        _, nz_col_indices_v, row_offsets_v = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold_v)
+        out_q = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W_q, row_offsets_q, nz_col_indices_q)
+        out_k = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W_k, row_offsets_k, nz_col_indices_k)
+        out_v = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W_v, row_offsets_v, nz_col_indices_v)
         out_2d = torch.cat([out_q, out_k, out_v], dim=1)
-        return out_2d.view(B, S, N)
+        return out_2d.view(B, M, N)
 
-class QKVSparseGEMMiCSRSVEGatherKernel(BaseKernel):
-    """
-    3D activation (B, S, K) -> view (M, K)，按稀疏度自适应调度 dense/sparse GEMM -> view (B, S, N)。
-    针对 QKV 三部分分别使用不同的 threshold，并对每部分应用自适应 dense/sparse 调度逻辑。
-    核心逻辑参考 LNSparseGEMMiCSRSVEGatherKernel：稀疏度 < DENSE_THRESHOLD 的连续行用 dense matmul，
-    否则用 sparse_gemm_icsr_sve_gather；M < MIN_DENSE_BLOCK 时按整体稀疏度选一路。
-    """
-
+#============================Adaptive Sparse Version=============================
+class AdaptiveSVEGatherGEMV(BaseKernel):
     def meta(
         self,
-        activation: torch.Tensor,
-        weight_q: torch.Tensor,
-        weight_k: torch.Tensor,
-        weight_v: torch.Tensor,
-        threshold_q: float,
-        threshold_k: float,
-        threshold_v: float,
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold: float,
     ) -> torch.Tensor:
-        N = weight_q.size(1) + weight_k.size(1) + weight_v.size(1)
-        return activation.new_empty((activation.size(0), activation.size(1), N))
+        return x.new_empty((x.size(0), x.size(1), W.size(1)))
 
     def forward(
         self,
-        activation: torch.Tensor,
-        weight_q: torch.Tensor,
-        weight_k: torch.Tensor,
-        weight_v: torch.Tensor,
-        threshold_q: float,
-        threshold_k: float,
-        threshold_v: float,
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold: float,
     ) -> torch.Tensor:
-        B, S, K = activation.shape
-        N_q = weight_q.size(1)
-        N_k = weight_k.size(1)
-        N_v = weight_v.size(1)
-        N = N_q + N_k + N_v
-        if (K,N_q) not in [(4096,4096)]:
-            out_q = torch.matmul(activation, weight_q)
-            out_k = torch.matmul(activation, weight_k)
-            out_v = torch.matmul(activation, weight_v)
-            return torch.cat([out_q, out_k, out_v], dim=1).view(B, S, N)
-        
-        act_2d = activation.view(-1, K)
-        BM = act_2d.shape[0]
-        
-        # 处理 Q 部分（使用 threshold_q）
-        nz_counts_q, nz_col_indices_q, row_offsets_q = thr_sparsify_to_icsr_sve(act_2d, threshold_q)
-        sparsity_q = 1.0 - (nz_counts_q.float() / K)
-        sparse_mask_q = sparsity_q > DENSE_THRESHOLD
-        
-        output_q = torch.zeros(BM, N_q, dtype=act_2d.dtype, device=act_2d.device)
-        i = 0
-        while i < BM:
-            if sparse_mask_q[i]:
-                j = i + 1
-                while j < BM and sparse_mask_q[j]:
-                    j += 1
-                offset_start = row_offsets_q[i].item()
-                offset_end = row_offsets_q[j].item()
-                block_row_offsets = row_offsets_q[i : j + 1] - offset_start
-                block_nz_col_indices = nz_col_indices_q[offset_start:offset_end]
-                output_q[i:j, :] = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                    act_2d[i:j, :], weight_q, block_row_offsets, block_nz_col_indices
-                )
-                i = j
+        B, M, K = x.shape
+        N = W.shape[1]
+        x_2d = x.view(-1, K)
+
+        if M > 1:
+            split_idx = x_2d.size(0) // 2
+            x_dense = x_2d[:split_idx]
+            out_dense = torch.ops.dense_op.dense_gemm_sve_omp(x_dense, W)
+
+            x_sparse = x_2d[split_idx:]
+            nnz_counts, nz_col_indices, row_offsets = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold)
+            if 1-nnz_counts.sum()/K/x_sparse.size(0) < MKN2sparsity.get((M, K, N), DEFAULT_SPARSITY):
+                out_sparse = torch.ops.dense_op.dense_gemm_sve_omp(x_sparse, W)
             else:
-                i += 1
-        
-        dense_indices_q = torch.where(~sparse_mask_q)[0]
-        if dense_indices_q.numel() > 0:
-            output_q[dense_indices_q] = torch.matmul(act_2d[dense_indices_q], weight_q)
-        
-        # 处理 K 部分（使用 threshold_k）
-        nz_counts_k, nz_col_indices_k, row_offsets_k = thr_sparsify_to_icsr_sve(act_2d, threshold_k)
-        sparsity_k = 1.0 - (nz_counts_k.float() / K)
-        sparse_mask_k = sparsity_k > DENSE_THRESHOLD
-        
-        output_k = torch.zeros(BM, N_k, dtype=act_2d.dtype, device=act_2d.device)
-        i = 0
-        while i < BM:
-            if sparse_mask_k[i]:
-                j = i + 1
-                while j < BM and sparse_mask_k[j]:
-                    j += 1
-                offset_start = row_offsets_k[i].item()
-                offset_end = row_offsets_k[j].item()
-                block_row_offsets = row_offsets_k[i : j + 1] - offset_start
-                block_nz_col_indices = nz_col_indices_k[offset_start:offset_end]
-                output_k[i:j, :] = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                    act_2d[i:j, :], weight_k, block_row_offsets, block_nz_col_indices
+                out_sparse = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                    x_sparse, W, row_offsets, nz_col_indices
                 )
-                i = j
-            else:
-                i += 1
-        
-        dense_indices_k = torch.where(~sparse_mask_k)[0]
-        if dense_indices_k.numel() > 0:
-            output_k[dense_indices_k] = torch.matmul(act_2d[dense_indices_k], weight_k)
-        
-        # 处理 V 部分（使用 threshold_v）
-        nz_counts_v, nz_col_indices_v, row_offsets_v = thr_sparsify_to_icsr_sve(act_2d, threshold_v)
-        sparsity_v = 1.0 - (nz_counts_v.float() / K)
-        sparse_mask_v = sparsity_v > DENSE_THRESHOLD
-        
-        output_v = torch.zeros(BM, N_v, dtype=act_2d.dtype, device=act_2d.device)
-        i = 0
-        while i < BM:
-            if sparse_mask_v[i]:
-                j = i + 1
-                while j < BM and sparse_mask_v[j]:
-                    j += 1
-                offset_start = row_offsets_v[i].item()
-                offset_end = row_offsets_v[j].item()
-                block_row_offsets = row_offsets_v[i : j + 1] - offset_start
-                block_nz_col_indices = nz_col_indices_v[offset_start:offset_end]
-                output_v[i:j, :] = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                    act_2d[i:j, :], weight_v, block_row_offsets, block_nz_col_indices
-                )
-                i = j
-            else:
-                i += 1
-        
-        dense_indices_v = torch.where(~sparse_mask_v)[0]
-        if dense_indices_v.numel() > 0:
-            output_v[dense_indices_v] = torch.matmul(act_2d[dense_indices_v], weight_v)
-        
-        # 拼接 Q, K, V 的输出
-        output = torch.cat([output_q, output_k, output_v], dim=1)
-        return output.view(B, S, N)
 
-class LNSparseGEMViCSRSVEGatherKernel(BaseKernel):
-    """3D activation (B, S, K) -> view to (B*S, K), then sparse GEMV/GEMM, output (B, S, N)."""
-
-    def meta(
-        self,
-        activation: torch.Tensor,
-        weight: torch.Tensor,
-        threshold: float
-    ) -> torch.Tensor:
-        return activation.new_empty((activation.size(0), activation.size(1), weight.size(1)))
-
-    def forward(
-        self,
-        activation: torch.Tensor,
-        weight: torch.Tensor,
-        threshold: float
-    ) -> torch.Tensor:
-        B, M, K = activation.shape
-        N = weight.shape[1]
-        if (K,N) not in [(4096,4096)]:
-            out = torch.matmul(x, weight)
-            return out.view(B, M, weight.size(1))
-
-        x = activation.view(-1, K)
-        nz_counts, nz_col_indices, row_offsets = torch.ops.sparse_op.thr_sparsify_to_icsr(x, threshold)
-        nz_count = nz_counts[0]
-        sparsity = nz_count / K
-        if sparsity > DENSE_THRESHOLD:
-            out = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                x, weight, row_offsets, nz_col_indices
-            )
-            # TODO: check use torch.matmul or my own gemm
-            # TODO: shape matters
+            out = torch.cat([out_dense, out_sparse], dim=0)
+            return out.view(B, M, N)
+        
+        nnz_counts, nz_col_indices, row_offsets = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold)
+        if 1-nnz_counts[0]/K < MKN2sparsity.get((M, K, N), DEFAULT_SPARSITY):
+            out = torch.ops.dense_op.dense_gemm_sve_omp(x_2d, W)
         else:
-            out = torch.matmul(x, weight)
+            out = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W, row_offsets, nz_col_indices)
 
-        return out.view(B, M, weight.size(1))
+        return out.view(B, M, N)
 
-
-class LNSparseGEMMiCSRSVEGatherKernel(BaseKernel):
+class QKVAdaptiveSVEGatherGEMV(BaseKernel):
     """
-    3D activation (B, S, K) -> view (M, K)，按稀疏度自适应调度 dense/sparse GEMM -> view (B, S, N)。
-    核心逻辑与 adaptive_sparse_gemm 一致：稀疏度 < DENSE_THRESHOLD 的连续行用 dense matmul，
-    否则用 sparse_gemm_icsr_sve_gather；M < MIN_DENSE_BLOCK 时按整体稀疏度选一路。
+    3D activation (B, S, K) -> view to (B*S, K), then sparse GEMV/GEMM, output (B, S, N).
+    使用三个不同的 threshold 分别处理 Q、K、V 三部分的 weight。
     """
-
     def meta(
         self,
-        activation: torch.Tensor,
-        weight: torch.Tensor,
-        threshold: float
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold_q: float,
+        threshold_k: float,
+        threshold_v: float,
+        kv_size: int,
+        W_q: torch.Tensor,
+        W_k: torch.Tensor,
+        W_v: torch.Tensor,
     ) -> torch.Tensor:
-        return activation.new_empty((activation.size(0), activation.size(1), weight.size(1)))
+        return x.new_empty((x.size(0), x.size(1), W.size(1)))
 
     def forward(
         self,
-        activation: torch.Tensor,
-        weight: torch.Tensor,
-        threshold: float
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold_q: float,
+        threshold_k: float,
+        threshold_v: float,
+        kv_size: int,
+        W_q: torch.Tensor,
+        W_k: torch.Tensor,
+        W_v: torch.Tensor,
     ) -> torch.Tensor:
-        load_sve_sparse_gemm_extension()
-        B, M, K = activation.shape
-        N = weight.size(1)
-        if (K,N) not in [(4096,4096)]:
-            out = torch.matmul(activation, weight)
-            return out.view(B, M, weight.size(1))
-        
-        x = activation.view(-1, K)
-        BM = x.shape[0]
-        nz_counts, nz_col_indices, row_offsets = thr_sparsify_to_icsr_sve(x, threshold)
+        B, M, K = x.shape
+        N = W.size(1)
+        x_2d = x.view(-1, K)
 
-        sparsity = 1.0 - (nz_counts.float() / K)
-        sparse_mask = sparsity > DENSE_THRESHOLD
+        if M > 1:
+            split_idx = x_2d.size(0) // 2
 
-        output = torch.zeros(BM, N, dtype=x.dtype, device=x.device)
-        i = 0
-        while i < BM:
-            if sparse_mask[i]:
-                j = i + 1
-                while j < BM and sparse_mask[j]:
-                    j += 1
-                offset_start = row_offsets[i].item()
-                offset_end = row_offsets[j].item()
-                block_row_offsets = row_offsets[i : j + 1] - offset_start
-                block_nz_col_indices = nz_col_indices[offset_start:offset_end]
-                output[i:j, :] = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
-                    x[i:j, :], weight, block_row_offsets, block_nz_col_indices
-                )
-                i = j
+            # Q
+            x_dense = x_2d[:split_idx]
+            out_dense = torch.ops.dense_op.dense_gemm_sve_omp(x_dense, W)
+
+            x_sparse = x_2d[split_idx:]
+            nnz_counts_q, nz_col_indices_q, row_offsets_q = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold_q)
+            nnz_counts_k, nz_col_indices_k, row_offsets_k = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold_k)
+            nnz_counts_v, nz_col_indices_v, row_offsets_v = torch.ops.sparse_op.thr_sparsify_to_icsr_sve(x_sparse, threshold_v)
+
+            sparsity_threshold = MKN2sparsity.get((M, K, W_q.size(1)), DEFAULT_SPARSITY)
+
+            # Q
+            if 1-nnz_counts_q.sum() / (K * x_sparse.size(0)) < sparsity_threshold:
+                out_sparse_q = torch.ops.dense_op.dense_gemm_sve_omp(x_sparse, W_q)
             else:
-                i += 1
+                out_sparse_q = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                    x_sparse, W_q, row_offsets_q, nz_col_indices_q
+                )
+            # K
+            if 1-nnz_counts_k.sum() / (K * x_sparse.size(0)) < sparsity_threshold:
+                out_sparse_k = torch.ops.dense_op.dense_gemm_sve_omp(x_sparse, W_k)
+            else:
+                out_sparse_k = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                    x_sparse, W_k, row_offsets_k, nz_col_indices_k
+                )
+            # V
+            if 1-nnz_counts_v.sum() / (K * x_sparse.size(0)) < sparsity_threshold:
+                out_sparse_v = torch.ops.dense_op.dense_gemm_sve_omp(x_sparse, W_v)
+            else:
+                out_sparse_v = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(
+                    x_sparse, W_v, row_offsets_v, nz_col_indices_v
+                )
 
-        dense_indices = torch.where(~sparse_mask)[0]
-        if dense_indices.numel() > 0:
-            output[dense_indices] = torch.matmul(x[dense_indices], weight)
-        return output.view(B, M, N)
+            out_sparse = torch.cat([out_sparse_q, out_sparse_k, out_sparse_v], dim=1)
+            out = torch.cat([out_dense, out_sparse], dim=0)
+            return out.view(B, M, N)
 
+        nnz_counts_q, nz_col_indices_q, row_offsets_q = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold_q)
+        nnz_counts_k, nz_col_indices_k, row_offsets_k = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold_k)
+        nnz_counts_v, nz_col_indices_v, row_offsets_v = torch.ops.sparse_op.thr_sparsify_to_icsr(x_2d, threshold_v)
+
+        sparsity_threshold = MKN2sparsity.get((M, K, W_q.size(1)), DEFAULT_SPARSITY)
+
+        if 1-nnz_counts_q[0] / K < sparsity_threshold:
+            out_q = torch.ops.dense_op.dense_gemm_sve_omp(x_2d, W_q)
+        else:
+            out_q = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W_q, row_offsets_q, nz_col_indices_q)
+        if 1-nnz_counts_k[0] / K < sparsity_threshold:
+            out_k = torch.ops.dense_op.dense_gemm_sve_omp(x_2d, W_k)
+        else:
+            out_k = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W_k, row_offsets_k, nz_col_indices_k)
+        if 1-nnz_counts_v[0] / K < sparsity_threshold:
+            out_v = torch.ops.dense_op.dense_gemm_sve_omp(x_2d, W_v)
+        else:
+            out_v = torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(x_2d, W_v, row_offsets_v, nz_col_indices_v)
+
+        out_2d = torch.cat([out_q, out_k, out_v], dim=1)
+        return out_2d.view(B, M, N)
+
+
+# =========================================================================================================================
+
+
+#============================Origin Sparse Version===========================
+import os
+import csv
+
+class StandardSparseGEMV(BaseKernel):
+
+    def meta(
+        self,
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold: float,
+    ) -> torch.Tensor:
+        return x.new_empty((x.size(0), x.size(1), W.shape[1]))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        W: torch.Tensor,
+        threshold: float,
+    ) -> torch.Tensor:
+        _, _, _ = torch.ops.sparse_op.thr_sparsify_to_icsr(torch.zeros(0,0), -1)
+        B, M, K = x.shape
+        N = W.shape[1]
+
+        x_2d = x.view(-1, K)
+
+        if M > 1:
+            split_idx = x_2d.size(0) // 2
+            x_dense = x_2d[:split_idx]
+            out_dense = torch.ops.dense_op.dense_gemm_sve_omp(x_dense, W)
+
+            x_sparse = x_2d[split_idx:]
+            x_thr = torch.where(x_sparse.abs() >= threshold, x_sparse, torch.zeros_like(x_sparse))
+            out_sparse = torch.sparse.mm(x_thr.to_sparse_csr(), W)
+            out = torch.cat([out_dense, out_sparse], dim=0)
+            return out.view(B, M, N)
+
+        x_thr = torch.where(x_2d.abs() >= threshold, x_2d, torch.zeros_like(x_2d))
+        x_sp = x_thr.to_sparse_csr()
+        out = torch.sparse.mm(x_sp, W)
+        return out.view(B, M, N)
+
+
+class QKVStandardSparseGEMV(BaseKernel):
+
+    def meta(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        threshold_q: float,
+        threshold_k: float,
+        threshold_v: float,
+        kv_size: int,
+        *args, **kwargs
+    ) -> torch.Tensor:
+        return x.new_empty((x.shape[0], x.shape[1], weight.shape[1]))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        threshold_q: float,
+        threshold_k: float,
+        threshold_v: float,
+        kv_size: int,
+        W_q: torch.Tensor,
+        W_k: torch.Tensor,
+        W_v: torch.Tensor,
+    ) -> torch.Tensor:
+        _, _, _ = torch.ops.sparse_op.thr_sparsify_to_icsr(torch.zeros(0,0), -1)
+        B, M, K = x.shape
+        N = weight.size(1)
+        x_2d = x.view(-1, K)
+
+        # 如果每个 token 有多个 kv（即 S > 1），则对前一半 dense、后一半 sparse
+        if M > 1:
+            split_idx = x_2d.size(0) // 2
+
+            # Dense 前半部分
+            x_dense = x_2d[:split_idx]
+            out_dense = torch.ops.dense_op.dense_gemm_sve_omp(x_dense, weight)
+
+            # Sparse 后半部分
+            x_sparse = x_2d[split_idx:]
+            x_q_sparse = torch.where(x_sparse.abs() >= threshold_q, x_sparse, torch.zeros_like(x_sparse))
+            x_k_sparse = torch.where(x_sparse.abs() >= threshold_k, x_sparse, torch.zeros_like(x_sparse))
+            x_v_sparse = torch.where(x_sparse.abs() >= threshold_v, x_sparse, torch.zeros_like(x_sparse))
+
+            out_sparse_q = torch.sparse.mm(x_q_sparse.to_sparse_csr(), W_q)
+            out_sparse_k = torch.sparse.mm(x_k_sparse.to_sparse_csr(), W_k)
+            out_sparse_v = torch.sparse.mm(x_v_sparse.to_sparse_csr(), W_v)
+
+            out_sparse = torch.cat([out_sparse_q, out_sparse_k, out_sparse_v], dim=1)
+
+            out = torch.cat([out_dense, out_sparse], dim=0)
+            return out.view(B, M, N)
+
+        x_q = torch.where(x_2d.abs() >= threshold_q, x_2d, torch.zeros_like(x_2d))
+        x_k = torch.where(x_2d.abs() >= threshold_k, x_2d, torch.zeros_like(x_2d))
+        x_v = torch.where(x_2d.abs() >= threshold_v, x_2d, torch.zeros_like(x_2d))
+
+        x_q_sp = x_q.to_sparse_csr()
+        x_k_sp = x_k.to_sparse_csr()
+        x_v_sp = x_v.to_sparse_csr()
+
+        out_q = torch.sparse.mm(x_q_sp, W_q)
+        out_k = torch.sparse.mm(x_k_sp, W_k)
+        out_v = torch.sparse.mm(x_v_sp, W_v)
+
+        out_2d = torch.cat([out_q, out_k, out_v], dim=1)
+        return out_2d.view(B, M, N)
 
 class SparseGEMViCSRSVEGatherKernel(BaseKernel):
     """torch.compile-friendly GEMV wrapper (iCSR SVE gather)."""
@@ -468,7 +567,7 @@ class SparseGEMViCSRSVEGatherKernel(BaseKernel):
         nz_row: int,
         nz_col_index: torch.Tensor,
     ) -> torch.Tensor:
-        load_sve_sparse_gemm_extension()
+        # load_sve_sparse_gemm_extension()
         return torch.ops.sparse_op.sparse_gemv_icsr_sve_gather(activation, weight, nz_row, nz_col_index)
 
 
@@ -503,7 +602,7 @@ class SparseGEMMiCSRSVEGatherKernel(BaseKernel):
         row_offsets: torch.Tensor,
         nz_col_indices: torch.Tensor,
     ) -> torch.Tensor:
-        load_sve_sparse_gemm_extension()
+        # load_sve_sparse_gemm_extension()
         return torch.ops.sparse_op.sparse_gemm_icsr_sve_gather(activation, weight, row_offsets, nz_col_indices)
 
 
@@ -933,6 +1032,36 @@ class DenseBaseGEMM(BaseKernel):
         print(f"{'='*80}\n")
 
 
+class DenseGEMMSVEOMPKernel(BaseKernel):
+    """torch.compile-friendly dense GEMM wrapper backed by the C++ OpenMP kernel."""
+
+    def meta(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        M = activation.size(0)
+        N = weight.size(1)
+        return activation.new_empty((M, N), device="meta")
+
+    def forward(
+        self,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        load_sve_sparse_gemm_extension()
+        return torch.ops.dense_op.dense_gemm_sve_omp(activation, weight)
+
+
+def dense_gemm_sve_omp(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Dense GEMM wrapper for the C++ OpenMP kernel."""
+    load_sve_sparse_gemm_extension(verbose=verbose)
+    return torch.ops.dense_op.dense_gemm_sve_omp(activation, weight)
+
 
 def thr_sparsify_to_icsr_sve(activation: torch.Tensor, threshold: float, verbose: bool = False):
     """Threshold-based dense -> iCSR sparsification (SVE/SVE2 accelerated)."""
@@ -1050,9 +1179,11 @@ __all__ = [
     "SparseGEMMCSCKernel",
     "SparseGEMMCOOKernel",
     "SparseGEMMCOOSVEGatherKernel",
+    "DenseGEMMSVEOMPKernel",
     # Adaptive GEMM/GEMV
     "adaptive_sparse_gemm",
     "adaptive_sparse_gemv",
+    "dense_gemm_sve_omp",
     # Sparsification utilities
     "thr_sparsify_to_icsr",
     "thr_sparsify_to_icsr_sve",

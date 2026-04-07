@@ -310,7 +310,7 @@ class SparseQKVGEMV(BaseKernel):
 
 
 # for testing purposes, to see if overhead at 0% is really due to strengthening torch.matmul (seems like it is)
-class DenseGEMV(BaseKernel):
+class OriginDenseGEMV(BaseKernel):
     def meta(self, x: torch.Tensor, W: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return x.new_empty(x.shape[0], x.shape[1], W.shape[0])
     

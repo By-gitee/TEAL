@@ -19,8 +19,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 # 与 test_csr_icsr_sve_spmm.py 默认配置一致
-DEFAULT_M_LIST = [1, 8]
-DEFAULT_KN_LIST = [(4096, 4096)]
+DEFAULT_M_LIST = [1, 4, 16, 32, 64, 128,256]
+DEFAULT_KN_LIST = [
+    (512, 512), (1024, 1024), (2048, 2048), (4096, 4096), (5120, 5120),
+    (512, 2048), (1024, 4096), (2048, 8192), (4096, 11008), (5120, 13824),
+    (2048, 512), (4096, 1024), (8192, 2048), (11008, 4096), (13824, 5120),
+]
 DEFAULT_DATA_DIR = Path("/dev/xvdb/data")
 
 

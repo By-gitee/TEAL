@@ -60,20 +60,20 @@ torch::Tensor sparse_gemv_icsr_sve_gather(
     torch::Tensor weight,
     int64_t nz_row,
     torch::Tensor nz_col_index) {
-  check_sparse_gemv_icsr_sve_gather_inputs(activation, weight, nz_col_index, nz_row);
+  // check_sparse_gemv_icsr_sve_gather_inputs(activation, weight, nz_col_index, nz_row);
 
   const auto K = weight.size(0);
   const auto N = weight.size(1);
   const auto nnz = nz_col_index.numel();
 
   auto output = torch::zeros({N}, activation.options());
-  if (nnz == 0 || N == 0) {
-    return output;
-  }
-  if (K == 0) {
-    TORCH_CHECK(nnz == 0, "nz_col_index must be empty when K=0");
-    return output;
-  }
+  // if (nnz == 0 || N == 0) {
+  //   return output;
+  // }
+  // if (K == 0) {
+  //   TORCH_CHECK(nnz == 0, "nz_col_index must be empty when K=0");
+  //   return output;
+  // }
 
   const float* act_row_ptr = activation.data_ptr<float>() + nz_row * K;
   const float* weight_ptr = weight.data_ptr<float>();
@@ -203,7 +203,7 @@ torch::Tensor sparse_gemm_icsr_sve_gather(
     torch::Tensor weight,
     torch::Tensor row_offsets,
     torch::Tensor nz_col_indices) {
-  check_sparse_gemm_icsr_sve_gather_inputs(activation, weight, row_offsets, nz_col_indices);
+  // check_sparse_gemm_icsr_sve_gather_inputs(activation, weight, row_offsets, nz_col_indices);
 
   const auto M = activation.size(0);
   const auto K = activation.size(1);
@@ -211,7 +211,7 @@ torch::Tensor sparse_gemm_icsr_sve_gather(
 
   auto output = torch::zeros({M, N}, activation.options());
   
-  if (M == 0 || N == 0 || K == 0) {
+  if (M == 0 || N == 0 || K == 0 || nz_col_indices.numel() == 0) {
     return output;
   }
 

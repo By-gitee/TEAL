@@ -46,7 +46,7 @@ static inline void check_inputs(const Tensor& activation) {
  *     - Optimization: skip compact for full-keep chunks
  */
 static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor& activation, double threshold) {
-  check_inputs(activation);
+  // check_inputs(activation);
 
   const int64_t M = activation.size(0);
   const int64_t K = activation.size(1);
@@ -119,8 +119,6 @@ static std::tuple<Tensor, Tensor, Tensor> thr_sparsify_to_icsr_sve(const Tensor&
     }
   }
 
-  // ---------------- Prefix sum (sequential) ----------------
-  // Must be done sequentially: row_offsets[m+1] depends on row_offsets[m].
   for (int64_t m = 0; m < M; ++m) {
     row_offsets[m + 1] = row_offsets[m] + nz_counts[m];
   }

@@ -21,15 +21,43 @@ torch._dynamo.config.suppress_errors = True
 # torch._inductor.config.epilogue_fusion = False
 
 # import sve sparse gemm
-from kernels.sve_sparse_gemm import (
-    DenseBaseGEMV,
-    DenseBaseGEMM,
-    QKVSparseGEMViCSRSVEGatherKernel,
-    QKVSparseGEMMiCSRSVEGatherKernel,
-    LNSparseGEMViCSRSVEGatherKernel,
-    LNSparseGEMMiCSRSVEGatherKernel,
-    USE_CUSTOM_SPARSE_GEMM
-)
+
+
+from kernels.sve_sparse_gemm import (StandardSparseGEMV, QKVStandardSparseGEMV,
+                                    SVEGatherGEMV,QKVSVEGatherGEMV,
+                                    AdaptiveSVEGatherGEMV,QKVAdaptiveSVEGatherGEMV,
+                                    DenseGEMV)
+
+
+KERNEL_IMPL = "sve"  
+
+KERNEL_IMPL_MAP = {
+    "dense" :{
+        "ffn": DenseGEMV,
+        "qkv": DenseGEMV,
+    },
+    # "standard": {
+    #     "ffn": StandardSparseGEMV,
+    #     "qkv": QKVStandardSparseGEMV,
+    # },
+    "sve": {
+        "ffn": SVEGatherGEMV,
+        "qkv": QKVSVEGatherGEMV,
+    },
+    "adaptive": {
+        "ffn": AdaptiveSVEGatherGEMV,
+        "qkv": QKVAdaptiveSVEGatherGEMV,
+    }
+}
+
+
+def build_kernel(kernel_cls, name, device):
+    kernel = kernel_cls.initialize(name, device)
+    return kernel, kernel.operator(False)
+
+
+ffn_kernel_cls = KERNEL_IMPL_MAP[KERNEL_IMPL]["ffn"]
+qkv_kernel_cls = KERNEL_IMPL_MAP[KERNEL_IMPL]["qkv"]
 
 import torch._dynamo.config
 import torch._inductor.config
@@ -206,7 +234,11 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
+    # TTFT: time from start of prefill to first token ready
+    t_ttft_start = time.perf_counter()
     next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
+    ttft_sec = time.perf_counter() - t_ttft_start
+
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
     seq[T] = next_token
@@ -235,7 +267,8 @@ def generate(
         seq[T + 1:] = torch.cat(generated_tokens)
 
     generate_stats = {
-        'accept_counts': accept_counts
+        'accept_counts': accept_counts,
+        'ttft': ttft_sec,
     }
     return seq, generate_stats
 
@@ -245,7 +278,7 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity):
+def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity, greedy_sparsity_path=None, greedy_sparsity_level=None):
     use_cuda = 'cuda' in device
     with torch.device('meta'):
         model = Transformer.from_name(checkpoint_path.parent.name)
@@ -282,65 +315,59 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
     import os
     from distribution import Distribution
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) # hack import parent dir
-    from kernels.sparse_gemv import SparseGEMV, SparseQKVGEMV, DenseGEMV
+    from kernels.sparse_gemv import SparseGEMV, SparseQKVGEMV, OriginDenseGEMV
     from utils.utils import get_layer_greedy_sparsities
-    sparse_levels = [sparsity]*len(model.layers)
     projs = ['q', 'k', 'v', 'o', 'up', 'gate', 'down']
-    
-    sparsities = {proj: sparse_levels for proj in projs}
+
+    # 从 lookup 取 threshold（与 teal/model.py load_greedy_sparsities 一致）或使用 icdf
+    if greedy_sparsity_path is not None and greedy_sparsity_level is not None:
+        layer_sparsity_levels = [greedy_sparsity_level] * len(model.layers)
+        sparsities = get_layer_greedy_sparsities(layer_sparsity_levels, greedy_sparsity_path)
+        use_threshold_lookup = True
+    else:
+        sparse_levels = [sparsity] * len(model.layers)
+        sparsities = {proj: sparse_levels for proj in projs}
+        use_threshold_lookup = False
 
     def monkeypatch_layer_sve_sparse(layer_idx, layer, sparsity, hist_path, device):
-        mlp_path = os.path.join(hist_path, f"layer-{layer_idx}", "mlp")
-        attn_path = os.path.join(hist_path, f"layer-{layer_idx}", "self_attn")
+        if use_threshold_lookup:
+            # 直接使用 lookup 中的 threshold（每层每 proj 已由 get_layer_greedy_sparsities 给出）
+            sparses = {proj: float(sparsities[proj][layer_idx]) for proj in projs}
+        else:
+            mlp_path = os.path.join(hist_path, f"layer-{layer_idx}", "mlp")
+            attn_path = os.path.join(hist_path, f"layer-{layer_idx}", "self_attn")
+            distrs = {}
+            distrs["mlp_h1"] = Distribution(mlp_path, "h1")
+            distrs["mlp_h2"] = Distribution(mlp_path, "h2")
+            distrs["attn_h1"] = Distribution(attn_path, "h1")
+            distrs["attn_h2"] = Distribution(attn_path, "h2")
+            sparses = {}
+            for proj in projs:
+                val = 0.5 + 0.5 * sparsities[proj][layer_idx]
+                if proj in ['q', 'k', 'v']:
+                    sparses[proj] = distrs["attn_h1"].icdf(val).item()
+                elif proj in ['o']:
+                    sparses[proj] = distrs["attn_h2"].icdf(val).item()
+                elif proj in ['up', 'gate']:
+                    sparses[proj] = distrs["mlp_h1"].icdf(val).item()
+                elif proj in ['down']:
+                    sparses[proj] = distrs["mlp_h2"].icdf(val).item()
 
-        distrs = {}
+        layer.feed_forward.gemv1_kernel,layer.feed_forward.gemv1 = build_kernel(ffn_kernel_cls, "sparse_gemv", device)
 
-        distrs["mlp_h1"] = Distribution(mlp_path, "h1")
-        distrs["mlp_h2"] = Distribution(mlp_path, "h2")
-        distrs["attn_h1"] = Distribution(attn_path, "h1")
-        distrs["attn_h2"] = Distribution(attn_path, "h2")
-
-        sparses = {}
-        for proj in projs:
-            val = 0.5 + 0.5*sparsities[proj][layer_idx]
-            if proj in ['q', 'k', 'v']:
-                sparses[proj] = distrs["attn_h1"].icdf(val).item()
-            elif proj in ['o']:
-                sparses[proj] = distrs["attn_h2"].icdf(val).item()
-            elif proj in ['up', 'gate']:
-                sparses[proj] = distrs["mlp_h1"].icdf(val).item()
-            elif proj in ['down']:
-                sparses[proj] = distrs["mlp_h2"].icdf(val).item()
-
-        is_sparse = USE_CUSTOM_SPARSE_GEMM
-
-        layer.feed_forward.gemm1_kernel = LNSparseGEMMiCSRSVEGatherKernel.initialize("ln_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
-        layer.feed_forward.gemm1 = layer.feed_forward.gemm1_kernel.operator(False)
-        layer.feed_forward.gemv1_kernel = LNSparseGEMViCSRSVEGatherKernel.initialize("ln_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
-        layer.feed_forward.gemv1 = layer.feed_forward.gemv1_kernel.operator(False)
-        
         layer.feed_forward.thresh_up = sparses["up"]
         layer.feed_forward.thresh_gate = sparses["gate"]
-        layer.feed_forward.sparsity_bin = 0
         layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.data.T.contiguous() # column major
         layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous() # T.c.T -> NxK T.c -> KxN . -> NxK column major torch.matmul(x,W.T) W.T -> KxN  W -> NxK
 
-        layer.feed_forward.gemm2_kernel = LNSparseGEMMiCSRSVEGatherKernel.initialize("ln_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
-        layer.feed_forward.gemm2 = layer.feed_forward.gemm2_kernel.operator(False)
-        layer.feed_forward.gemv2_kernel = LNSparseGEMViCSRSVEGatherKernel.initialize("ln_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
-        layer.feed_forward.gemv2 = layer.feed_forward.gemv2_kernel.operator(False)
+        layer.feed_forward.gemv2_kernel,layer.feed_forward.gemv2 = build_kernel(ffn_kernel_cls, "sparse_gemv", device)
         layer.feed_forward.thresh_down = sparses["down"]
-        layer.feed_forward.sparsity_bin = 0
         layer.feed_forward.w2.weight.data = layer.feed_forward.w2.weight.data.T.contiguous() # column major
 
-        layer.attention.gemm1_kernel = QKVSparseGEMMiCSRSVEGatherKernel.initialize("qkv_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
-        layer.attention.gemm1 = layer.attention.gemm1_kernel.operator(False)
-        layer.attention.gemv1_kernel = QKVSparseGEMViCSRSVEGatherKernel.initialize("qkv_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
-        layer.attention.gemv1 = layer.attention.gemv1_kernel.operator(False)
+        layer.attention.gemv1_kernel,layer.attention.gemv1 = build_kernel(qkv_kernel_cls, "qkv_sparse_gemv", device)
         layer.attention.thresh_q = sparses["q"]
         layer.attention.thresh_k = sparses["k"]
         layer.attention.thresh_v = sparses["v"]
-        layer.attention.sparsity_bin = 0
         
         kv_size = layer.attention.n_local_heads * layer.attention.head_dim
         N_k = kv_size
@@ -350,15 +377,11 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.attention.wq = layer.attention.wq.T.contiguous()
         layer.attention.wk = layer.attention.wk.T.contiguous()
         layer.attention.wv = layer.attention.wv.T.contiguous()
+        layer.attention.wqkvall = layer.attention.wqkv.weight.data.T.contiguous()
 
-        layer.attention.gemm2_kernel = LNSparseGEMMiCSRSVEGatherKernel.initialize("ln_sparse_gemm_icsr_sve_gather", device) if is_sparse else DenseBaseGEMM.initialize("dense_base_gemm", device)
-        layer.attention.gemm2 = layer.attention.gemm2_kernel.operator(False)
-        layer.attention.gemv2_kernel = LNSparseGEMViCSRSVEGatherKernel.initialize("ln_sparse_gemv_icsr_sve_gather", device) if is_sparse else DenseBaseGEMV.initialize("dense_base_gemv", device)
-        layer.attention.gemv2 = layer.attention.gemv2_kernel.operator(False)
+        layer.attention.gemv2_kernel, layer.attention.gemv2 = build_kernel(ffn_kernel_cls, "sparse_gemv", device)
         layer.attention.thresh_o = sparses["o"]
-        layer.attention.sparsity_bin = 0
         layer.attention.wo.weight.data = layer.attention.wo.weight.data.T.contiguous() # column major
-
         # replace forwards
         layer.feed_forward.apply_monkeypatch()
         layer.attention.apply_monkeypatch()
@@ -370,31 +393,31 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
             gc.collect() # Force garbage collection to free up CPU memory
 
     def monkeypatch_layer(layer_idx, layer, sparsity, hist_path, device):
-        mlp_path = os.path.join(hist_path, f"layer-{layer_idx}", "mlp")
-        attn_path = os.path.join(hist_path, f"layer-{layer_idx}", "self_attn")
-
-        distrs = {}
-
-        distrs["mlp_h1"] = Distribution(mlp_path, "h1")
-        distrs["mlp_h2"] = Distribution(mlp_path, "h2")
-        distrs["attn_h1"] = Distribution(attn_path, "h1")
-        distrs["attn_h2"] = Distribution(attn_path, "h2")
-
-        sparses = {}
-        for proj in projs:
-            val = 0.5 + 0.5*sparsities[proj][layer_idx]
-            if proj in ['q', 'k', 'v']:
-                sparses[proj] = distrs["attn_h1"].icdf(val).item()
-            elif proj in ['o']:
-                sparses[proj] = distrs["attn_h2"].icdf(val).item()
-            elif proj in ['up', 'gate']:
-                sparses[proj] = distrs["mlp_h1"].icdf(val).item()
-            elif proj in ['down']:
-                sparses[proj] = distrs["mlp_h2"].icdf(val).item()
+        if use_threshold_lookup:
+            sparses = {proj: float(sparsities[proj][layer_idx]) for proj in projs}
+        else:
+            mlp_path = os.path.join(hist_path, f"layer-{layer_idx}", "mlp")
+            attn_path = os.path.join(hist_path, f"layer-{layer_idx}", "self_attn")
+            distrs = {}
+            distrs["mlp_h1"] = Distribution(mlp_path, "h1")
+            distrs["mlp_h2"] = Distribution(mlp_path, "h2")
+            distrs["attn_h1"] = Distribution(attn_path, "h1")
+            distrs["attn_h2"] = Distribution(attn_path, "h2")
+            sparses = {}
+            for proj in projs:
+                val = 0.5 + 0.5*sparsities[proj][layer_idx]
+                if proj in ['q', 'k', 'v']:
+                    sparses[proj] = distrs["attn_h1"].icdf(val).item()
+                elif proj in ['o']:
+                    sparses[proj] = distrs["attn_h2"].icdf(val).item()
+                elif proj in ['up', 'gate']:
+                    sparses[proj] = distrs["mlp_h1"].icdf(val).item()
+                elif proj in ['down']:
+                    sparses[proj] = distrs["mlp_h2"].icdf(val).item()
 
         is_sparse = False
 
-        layer.feed_forward.gemv1_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        layer.feed_forward.gemv1_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else OriginDenseGEMV.initialize("dense_gemv", device)
         layer.feed_forward.gemv1 = layer.feed_forward.gemv1_kernel.operator(False)
         layer.feed_forward.thresh_up = sparses["up"]
         layer.feed_forward.thresh_gate = sparses["gate"]
@@ -402,13 +425,13 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.data.T.contiguous().T # column major
         layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous().T # T.c.T -> NxK T.c -> KxN . -> NxK column major torch.matmul(x,W.T) W.T -> KxN  W -> NxK
 
-        layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else OriginDenseGEMV.initialize("dense_gemv", device)
         layer.feed_forward.gemv2 = layer.feed_forward.gemv2_kernel.operator(False)
         layer.feed_forward.thresh_down = sparses["down"]
         layer.feed_forward.sparsity_bin = 0
         layer.feed_forward.w2.weight.data = layer.feed_forward.w2.weight.data.T.contiguous().T # column major
 
-        layer.attention.gemv1_kernel = SparseQKVGEMV.initialize("sparse_qkv_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        layer.attention.gemv1_kernel = SparseQKVGEMV.initialize("sparse_qkv_gemv", device) if is_sparse else OriginDenseGEMV.initialize("dense_gemv", device)
         layer.attention.gemv1 = layer.attention.gemv1_kernel.operator(False)
         layer.attention.thresh_q = sparses["q"]
         layer.attention.thresh_k = sparses["k"]
@@ -416,7 +439,7 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.attention.sparsity_bin = 0
         layer.attention.wqkv.weight.data = layer.attention.wqkv.weight.data.T.contiguous().T # column major
 
-        layer.attention.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        layer.attention.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else OriginDenseGEMV.initialize("dense_gemv", device)
         layer.attention.gemv2 = layer.attention.gemv2_kernel.operator(False)
         layer.attention.thresh_o = sparses["o"]
         layer.attention.sparsity_bin = 0
@@ -435,9 +458,9 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
     print("Monkeypatching with activation sparsity...")
     print(model.layers[0].feed_forward.w1.weight.data.shape)
     from tp import _get_rank
-    from kernels.sve_sparse_gemm import load_sve_sparse_gemm_extension
-    load_sve_sparse_gemm_extension()
-    if hist_path is not None:
+
+    do_sparse_monkeypatch = hist_path is not None or (greedy_sparsity_path is not None and greedy_sparsity_level is not None)
+    if do_sparse_monkeypatch:
         device = model.layers[0].feed_forward.w1.weight.device.type
         for layer_idx, layer in enumerate(model.layers):
             monkeypatch_layer_sve_sparse(layer_idx, layer, sparsity, hist_path, device)     
@@ -461,7 +484,7 @@ def _get_model_size(model):
 B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
-    prompt: str = "Hello, my name is",
+    prompt: str = "Artificial intelligence has become an important area of research and application in modern society. It is widely used in natural language processing, computer vision, recommendation systems, and scientific computing. Recent advances in large language models have demonstrated strong capabilities in reasoning, generation, and understanding tasks. These models are typically trained on large-scale corpora collected from diverse sources, including books, articles, and web pages. As a result, they are able to capture complex linguistic patterns and world knowledge. However, the increasing model size also brings significant computational challenges, especially during inference on resource-constrained devices. Researchers have proposed various optimization techniques, such as quantization, pruning, and sparsity, to reduce computation and memory overhead. Among these approaches, activation sparsity dynamically removes less important values during inference, enabling more efficient execution while maintaining model accuracy.",
     interactive: bool = False,
     num_samples: int = 5,
     max_new_tokens: int = 100,
@@ -478,6 +501,8 @@ def main(
     # monkeypatch
     hist_path: str = None,
     sparsity: float = 0.0,
+    greedy_sparsity_path: str = None,
+    greedy_sparsity_level: float = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -502,14 +527,21 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-
+    from kernels.sve_sparse_gemm import load_sve_sparse_gemm_extension
+    load_sve_sparse_gemm_extension()
+    print("Using kernel implementation: ", KERNEL_IMPL)
     # NOTE: specdecoding is untested
     if is_speculative:
-        model = _load_model(checkpoint_path, device, precision, use_tp, hist_path=None, sparsity=0)
-        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp, hist_path, sparsity)
+        model = _load_model(checkpoint_path, device, precision, use_tp, hist_path=None, sparsity=0, greedy_sparsity_path=None, greedy_sparsity_level=None)
+        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp, hist_path, sparsity, greedy_sparsity_path, greedy_sparsity_level)
     else:
-        model = _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
+        model = _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity, greedy_sparsity_path, greedy_sparsity_level)
         draft_model = None
+
+    if model is None:
+        raise RuntimeError("Failed to load main model from: {}".format(checkpoint_path))
+    if is_speculative and draft_model is None:
+        raise RuntimeError("Failed to load draft model from: {}".format(draft_checkpoint_path))
 
     device_sync(device=device) # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
@@ -517,6 +549,7 @@ def main(
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 
     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    encoded = encoded[:128]
     prompt_length = encoded.size(0)
 
     torch.manual_seed(1234)
@@ -540,6 +573,7 @@ def main(
     aggregate_metrics = {
         'tokens_per_sec': [],
         'accept_counts': [],
+        'ttft': [],
     }
     start = -1 if compile else 0
 
@@ -568,6 +602,7 @@ def main(
                 # print(, end='', flush=True)
         else:
             callback = lambda x : x
+
         t0 = time.perf_counter()
         import contextlib
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
@@ -588,11 +623,10 @@ def main(
                 top_k=top_k,
             )
 
-            # 打印统计
-        from kernels.sve_sparse_gemm import DenseBaseGEMV
-        if hist_path is not None:  # 只在使用 monkeypatch 时打印
-            DenseBaseGEMV.print_statistics()
+        if hist_path is not None or (greedy_sparsity_path is not None and greedy_sparsity_level is not None):  # 只在使用 monkeypatch 时打印
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
+        if i >= 0:
+            aggregate_metrics['ttft'].append(metrics.get('ttft', 0.0))
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
@@ -612,6 +646,7 @@ def main(
         tokens_sec = tokens_generated / t
         aggregate_metrics['tokens_per_sec'].append(tokens_sec)
         print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
+        print(f"TTFT: {metrics.get('ttft', 0)*1000:.2f} ms")
         print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
     print("==========")
     if is_speculative:
@@ -621,6 +656,8 @@ def main(
         print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
 
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
+    if aggregate_metrics['ttft']:
+        print(f"Average TTFT: {torch.mean(torch.tensor(aggregate_metrics['ttft'])).item()*1000:.2f} ms")
     if "cuda" in str(device):
         print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
     else:
@@ -632,7 +669,10 @@ def main(
         "timestamp": datetime.now().isoformat(),
         "model_name": str(checkpoint_path),
         "sparsity": sparsity,
+        "greedy_sparsity_path": greedy_sparsity_path,
+        "greedy_sparsity_level": greedy_sparsity_level,
         "average_tokens_per_sec": torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item(),
+        "average_ttft_ms": torch.mean(torch.tensor(aggregate_metrics['ttft'])).item() * 1000 if aggregate_metrics['ttft'] else None,
         "max_memory_used_gb": torch.cuda.max_memory_reserved() / 1e9,
     }
 
@@ -650,11 +690,14 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    # parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    # parser.add_argument('--prompt', type=str, default="In a quiet research lab , , , , ,  an engineer studies how a transformer model reads text , builds attention maps , and predicts the next token …. 1. She writes notes about embeddings , positional signals , ,  ,, , and layers that mix context across long  ,,sequences .2.  Sometimes she pauses , ,,,asking :A. can sparse activations reduce computation without hurting meaning ? To test the idea , B. she feeds prompts with questions ….commas ….periods , and C. exclamation marks !  .", help='Input prompt.')
+    parser.add_argument('--prompt', type=str, default="Artificial intelligence has become an important area of research and application in modern society. It is widely used in natural language processing, computer vision, recommendation systems, and scientific computing. Recent advances in large language models have demonstrated strong capabilities in reasoning, generation, and understanding tasks. These models are typically trained on large-scale corpora collected from diverse sources, including books, articles, and web pages. As a result, they are able to capture complex linguistic patterns and world knowledge. However, the increasing model size also brings significant computational challenges, especially during inference on resource-constrained devices. Researchers have proposed various optimization techniques, such as quantization, pruning, and sparsity, to reduce computation and memory overhead. Among these approaches, activation sparsity dynamically removes less important values during inference, enabling more efficient execution while maintaining model accuracy.", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
-    parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
+    parser.add_argument('--num_samples', type=int, default=16, help='Number of samples.')
+    # parser.add_argument('--num_samples', type=int, default=16, help='Number of samples.')
+    parser.add_argument('--max_new_tokens', type=int, default=2, help='Maximum number of new tokens.')
+    parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.') 
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
@@ -667,6 +710,8 @@ if __name__ == '__main__':
     # monkeypatch
     parser.add_argument('--hist_path', type=str, default=None, help='Histogram path.')
     parser.add_argument('--sparsity', type=float, default=0, help='Sparsity level.')
+    parser.add_argument('--greedy_sparsity_path', type=str, default=None, help='Lookup dir for greedy thresholds (same as teal load_greedy_sparsities).')
+    parser.add_argument('--greedy_sparsity_level', type=float, default=None, help='Target effective sparsity for lookup (e.g. 0.5).')
 
     args = parser.parse_args()
     main(
@@ -674,5 +719,5 @@ if __name__ == '__main__':
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
         args.speculate_k, args.device, 
         # monkeypatch
-        args.hist_path, args.sparsity,
+        args.hist_path, args.sparsity, args.greedy_sparsity_path, args.greedy_sparsity_level,
     )
